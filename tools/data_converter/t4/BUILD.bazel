@@ -13,19 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Import common dependencies
--r requirements_tests.in
--r requirements_ncore.in
--r requirements_docs.in
--r requirements_typing.in
--r requirements_tools.in
--r requirements_waymo.in
--r requirements_colmap.in
--r requirements_pai.in
--r requirements_t4.in
+load("@ncore_pip_deps//:requirements.bzl", "requirement")
+load("@rules_python//python:defs.bzl", "py_binary")
 
-# Public API restrictions for 3.11
-numpy<2 # torch-1.x is build against numpy-1.x, but doesn't explicitly state this requirement
+package(default_visibility = ["//visibility:public"])
 
---find-links https://download.pytorch.org/whl/torch_stable.html
-torch==1.13.0+cu116
+py_binary(
+    name = "convert",
+    srcs = ["converter.py"],
+    main = "converter.py",
+    deps = [
+        "//ncore:pylib",
+        "//tools/data_converter:pylib_cli",
+        requirement("click"),
+        requirement("numpy"),
+        requirement("t4-devkit"),
+        requirement("tqdm"),
+        requirement("universal-pathlib"),
+    ],
+)
+
+alias(
+    name = "t4",
+    actual = ":convert",
+)
