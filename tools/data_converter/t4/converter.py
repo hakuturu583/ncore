@@ -22,6 +22,7 @@ import logging
 import os.path as osp
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 import click
@@ -54,6 +55,7 @@ from t4_devkit.dataclass.pointcloud import PointCloudMetainfo, RadarPointCloud
 from t4_devkit.schema import SchemaName
 from t4_devkit.schema.tables.sample_data import FileFormat, SampleData
 from tools.data_converter.cli import cli
+from tools.data_converter.t4.pcd import ParsedPcd, load_pcd
 
 
 CONVERTER_VERSION = "1.0.0"
@@ -176,6 +178,7 @@ class T4Converter4Config(FileBasedDataConverterConfig):
     component_group_profile: Literal["default", "separate-sensors", "separate-all"] = "separate-sensors"
     store_sequence_meta: bool = True
     world_global_mode: Literal["none", "identity", "localized"] = "localized"
+    pcd_map_path: str | None = None
 
 
 class T4Converter4(FileBasedDataConverter):
@@ -190,6 +193,7 @@ class T4Converter4(FileBasedDataConverter):
         self.component_group_profile = config.component_group_profile
         self.store_sequence_meta = config.store_sequence_meta
         self.world_global_mode = config.world_global_mode
+        self.pcd_map_path = config.pcd_map_path
         self.logger = logging.getLogger(__name__)
         self.t4 = Tier4(str(self.root_dir), revision=self.revision, verbose=False)
 
@@ -247,6 +251,98 @@ class T4Converter4(FileBasedDataConverter):
 
     def _sequence_id(self, scene: Any) -> str:
         return f"t4_{_sanitize_identifier(scene.name)}_{scene.token[:8]}"
+
+    def _resolve_pcd_map_path(self, scene: Any) -> Path | None:
+        """Resolve a PCD map file for the current scene, if one exists."""
+
+        def _find_candidate(directory: Path, strict: bool) -> Path | None:
+            if not directory.exists() or not directory.is_dir():
+                return None
+
+            pcd_files = sorted(directory.rglob("*.pcd"))
+            if not pcd_files:
+                return None
+
+            preferred = [
+                p
+                for p in pcd_files
+                if any(token in p.name.lower() for token in ("pcd_map", "pointcloud_map", "point_cloud_map", "map"))
+            ]
+            if len(preferred) == 1:
+                return preferred[0]
+            if len(preferred) > 1:
+                if not strict:
+                    return None
+                raise ValueError(f"Ambiguous PCD map candidates in {directory}: {preferred}")
+            if len(pcd_files) == 1:
+                return pcd_files[0]
+            if not strict:
+                return None
+            raise ValueError(f"Ambiguous PCD map candidates in {directory}: {pcd_files}")
+
+        if self.pcd_map_path:
+            configured = Path(self.pcd_map_path)
+            if configured.exists():
+                if configured.is_file():
+                    return configured
+                resolved = _find_candidate(configured, strict=True)
+                if resolved is None:
+                    raise FileNotFoundError(f"No PCD files found under {configured}")
+                return resolved
+
+            root_candidate = Path(str(self.root_dir)) / self.pcd_map_path
+            if root_candidate.exists():
+                if root_candidate.is_file():
+                    return root_candidate
+                resolved = _find_candidate(root_candidate, strict=True)
+                if resolved is None:
+                    raise FileNotFoundError(f"No PCD files found under {root_candidate}")
+                return resolved
+
+            raise FileNotFoundError(f"PCD map path does not exist: {self.pcd_map_path}")
+
+        root_dir = Path(str(self.root_dir))
+        relative_map_dir = root_dir / "annotation_dataset" / str(self.t4.dataset_id) / str(self.t4.version) / "map"
+        resolved = _find_candidate(relative_map_dir, strict=False)
+        if resolved is not None:
+            return resolved
+
+        scene_candidates = [root_dir / scene.name, root_dir / scene.token]
+        for candidate in scene_candidates:
+            resolved = _find_candidate(candidate, strict=False)
+            if resolved is not None:
+                return resolved
+
+        return _find_candidate(root_dir, strict=False)
+
+    def _store_pcd_map(self, sequence_start_timestamp_us: int, pcd_map_path: Path, reference_frame_id: str) -> None:
+        parsed_pcd: ParsedPcd = load_pcd(pcd_map_path)
+        attribute_schemas = {
+            field.name: PointCloudsComponent.AttributeSchema(
+                transform_type=PointCloud.AttributeTransformType.INVARIANT,
+                dtype=field.values.dtype,
+                shape_suffix=field.values.shape[1:],
+            )
+            for field in parsed_pcd.fields
+        }
+        point_cloud_writer = self.store_writer.register_component_writer(
+            PointCloudsComponent.Writer,
+            component_instance_name="map",
+            group_name=self.component_groups.point_clouds_component_groups.get("map"),
+            coordinate_unit=PointCloud.CoordinateUnit.METERS,
+            attribute_schemas=attribute_schemas,
+        )
+        point_cloud_writer.store_pc(
+            xyz=parsed_pcd.xyz,
+            reference_frame_id=reference_frame_id,
+            reference_frame_timestamp_us=sequence_start_timestamp_us,
+            attributes={field.name: field.values for field in parsed_pcd.fields},
+            generic_meta_data={
+                "source_type": "pcd_map",
+                "source_path": str(pcd_map_path),
+                "pcd_header": parsed_pcd.header,
+            },
+        )
 
     def _store_poses(self, ego_pose_records: list[Any]) -> np.ndarray | None:
         timestamps_us = np.array([record.timestamp for record in ego_pose_records], dtype=np.uint64)
@@ -616,10 +712,12 @@ class T4Converter4(FileBasedDataConverter):
         lidar_id_by_channel = {channel: _channel_to_ncore_id(channel) for channel in lidar_channels}
         radar_id_by_channel = {channel: _channel_to_ncore_id(channel) for channel in radar_channels}
 
+        pcd_map_path = self._resolve_pcd_map_path(scene)
+
         active_camera_ids = self.get_active_camera_ids(list(camera_id_by_channel.values()))
         active_lidar_ids = self.get_active_lidar_ids(list(lidar_id_by_channel.values()))
         active_radar_ids = self.get_active_radar_ids(list(radar_id_by_channel.values()))
-        point_cloud_ids = active_lidar_ids + active_radar_ids
+        point_cloud_ids = active_lidar_ids + active_radar_ids + (["map"] if pcd_map_path is not None else [])
 
         self.component_groups = ComponentGroupAssignments.create(
             camera_ids=active_camera_ids,
@@ -678,6 +776,12 @@ class T4Converter4(FileBasedDataConverter):
             active_radar_ids,
             radar_id_by_channel,
         )
+        if pcd_map_path is not None:
+            self._store_pcd_map(
+                scene_samples[0].timestamp,
+                pcd_map_path,
+                reference_frame_id="world_global" if T_world_world_global is not None else "world",
+            )
         self._store_cuboids(scene_samples, T_world_world_global)
 
         ncore_4_paths = self.store_writer.finalize()
@@ -741,6 +845,12 @@ class T4Converter4(FileBasedDataConverter):
         - "none": No world_global pose. Poses remain in source coordinates.
         - "identity": Store an identity world_global pose. Poses remain in source coordinates.
         - "localized": Rebase poses relative to the first frame and store the original first pose as world->world_global.""",
+)
+@click.option(
+    "--pcd-map-path",
+    type=str,
+    default=None,
+    help="Optional path to a PCD map file or directory. If omitted, the converter tries to auto-discover a unique .pcd map under the T4 root.",
 )
 @click.pass_context
 def t4_v4(ctx, *_, **kwargs):

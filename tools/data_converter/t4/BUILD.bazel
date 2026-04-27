@@ -14,15 +14,25 @@
 # limitations under the License.
 
 load("@ncore_pip_deps//:requirements.bzl", "requirement")
-load("@rules_python//python:defs.bzl", "py_binary")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
 
 package(default_visibility = ["//visibility:public"])
+
+py_library(
+    name = "pylib",
+    srcs = ["pcd.py"],
+    deps = [
+        requirement("numpy"),
+    ],
+)
 
 py_binary(
     name = "convert",
     srcs = ["converter.py"],
     main = "converter.py",
     deps = [
+        ":pylib",
         "//ncore:pylib",
         "//tools/data_converter:pylib_cli",
         requirement("click"),
@@ -36,4 +46,13 @@ py_binary(
 alias(
     name = "t4",
     actual = ":convert",
+)
+
+pytest_test(
+    name = "test",
+    srcs = ["test_pcd.py"],
+    deps = [
+        ":pylib",
+        requirement("numpy"),
+    ],
 )
