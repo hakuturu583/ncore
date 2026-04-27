@@ -252,7 +252,7 @@ class T4Converter4(FileBasedDataConverter):
     def _sequence_id(self, scene: Any) -> str:
         return f"t4_{_sanitize_identifier(scene.name)}_{scene.token[:8]}"
 
-    def _resolve_pcd_map_path(self, scene: Any) -> Path | None:
+    def _resolve_pcd_map_path(self) -> Path | None:
         """Resolve a PCD map file for the current scene, if one exists."""
 
         def _find_candidate(directory: Path, strict: bool) -> Path | None:
@@ -306,17 +306,14 @@ class T4Converter4(FileBasedDataConverter):
         resolved = _find_candidate(relative_map_dir, strict=False)
         if resolved is not None:
             return resolved
-
-        scene_candidates = [root_dir / scene.name, root_dir / scene.token]
-        for candidate in scene_candidates:
-            resolved = _find_candidate(candidate, strict=False)
-            if resolved is not None:
-                return resolved
-
-        return _find_candidate(root_dir, strict=False)
+        return None
 
     def _store_pcd_map(self, sequence_start_timestamp_us: int, pcd_map_path: Path, reference_frame_id: str) -> None:
-        parsed_pcd: ParsedPcd = load_pcd(pcd_map_path)
+        try:
+            parsed_pcd: ParsedPcd = load_pcd(pcd_map_path)
+        except NotImplementedError as exc:
+            self.logger.warning("Skipping PCD map export for %s: %s", pcd_map_path, exc)
+            return
         attribute_schemas = {
             field.name: PointCloudsComponent.AttributeSchema(
                 transform_type=PointCloud.AttributeTransformType.INVARIANT,
@@ -712,7 +709,7 @@ class T4Converter4(FileBasedDataConverter):
         lidar_id_by_channel = {channel: _channel_to_ncore_id(channel) for channel in lidar_channels}
         radar_id_by_channel = {channel: _channel_to_ncore_id(channel) for channel in radar_channels}
 
-        pcd_map_path = self._resolve_pcd_map_path(scene)
+        pcd_map_path = self._resolve_pcd_map_path()
 
         active_camera_ids = self.get_active_camera_ids(list(camera_id_by_channel.values()))
         active_lidar_ids = self.get_active_lidar_ids(list(lidar_id_by_channel.values()))
