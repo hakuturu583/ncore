@@ -22,6 +22,22 @@ bazel run //tools/data_converter/t4:convert -- \
     --scene-name my_scene
 ```
 
+To also export a PCD map as a `PointCloudsComponent`, provide a PCD file or
+directory:
+
+```bash
+bazel run //tools/data_converter/t4:convert -- \
+    --root-dir /path/to/t4-dataset \
+    --output-dir /path/to/ncore-output \
+    --pcd-map-path /path/to/map.pcd \
+    t4-v4
+```
+
+If `--pcd-map-path` is omitted, the converter tries to auto-discover a unique
+`.pcd` file under the T4 root, including the conventional
+`annotation_dataset/<dataset_id>/<version>/map` directory. For multi-scene
+datasets, passing the map path explicitly is still safer.
+
 ## Conversion Mapping
 
 - `scene` -> one NCore sequence
