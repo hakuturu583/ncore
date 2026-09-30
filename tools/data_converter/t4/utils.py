@@ -25,6 +25,7 @@ _OPTIONAL_FILES: tuple[str, ...] = (
     "sample_annotation",
     "instance",
     "category",
+    "visibility",
 )
 ANNOTATION_FILES: tuple[str, ...] = _REQUIRED_FILES + _OPTIONAL_FILES
 
@@ -78,12 +79,45 @@ def t4_pose_to_se3(translation: List[float], rotation_wxyz: List[float]) -> np.n
 _T4_LIDAR_FLOATS_PER_POINT = 5
 
 
-def load_lidar_xyzi(path: Path) -> np.ndarray:
-    """Load a ``LIDAR_CONCAT/*.pcd.bin`` file as an Nx4 float32 (x, y, z, intensity) array."""
+def load_lidar_points(path: Path) -> np.ndarray:
+    """Load a ``LIDAR_CONCAT/*.pcd.bin`` file as an Nx5 float32 (x, y, z, intensity, ring) array."""
     raw = np.fromfile(path, dtype=np.float32)
     if raw.size % _T4_LIDAR_FLOATS_PER_POINT != 0:
         raise ValueError(
-            f"Lidar point buffer size {raw.size} (path={path}) is not a multiple "
-            f"of {_T4_LIDAR_FLOATS_PER_POINT}"
+            f"Lidar point buffer size {raw.size} (path={path}) is not a multiple of {_T4_LIDAR_FLOATS_PER_POINT}"
         )
-    return raw.reshape(-1, _T4_LIDAR_FLOATS_PER_POINT)[:, :4]
+    return raw.reshape(-1, _T4_LIDAR_FLOATS_PER_POINT)
+
+
+def load_lidar_xyzi(path: Path) -> np.ndarray:
+    """Load a ``LIDAR_CONCAT/*.pcd.bin`` file as an Nx4 float32 (x, y, z, intensity) array."""
+    return load_lidar_points(path)[:, :4]
+
+
+def keyframe_index_by_sample_token(samples: List[Dict[str, Any]], scene: Dict[str, Any]) -> Dict[str, int]:
+    """Ordinal of each ``sample`` along the scene's ``first_sample_token`` -> ``next`` chain.
+
+    gaussian_factory names keyframe artifacts ``frame_{ordinal:04d}``.
+    """
+    by_token = index_by_token(samples)
+    out: Dict[str, int] = {}
+    token = scene.get("first_sample_token", "")
+    while token and token in by_token and token not in out:
+        out[token] = len(out)
+        token = by_token[token].get("next", "")
+    return out
+
+
+def t4_distortion_to_opencv(distortion: List[float]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split a T4 ``camera_distortion`` vector into NCore OpenCV pinhole coefficients.
+
+    T4 stores OpenCV-ordered coefficients ``[k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4]``
+    truncated to 0/4/5/8/12 entries. Returns ``(radial[6], tangential[2], thin_prism[4])``.
+    """
+    d = np.zeros(12, dtype=np.float32)
+    n = min(len(distortion), 12)
+    d[:n] = np.asarray(distortion[:n], dtype=np.float32)
+    radial = np.array([d[0], d[1], d[4], d[5], d[6], d[7]], dtype=np.float32)
+    tangential = np.array([d[2], d[3]], dtype=np.float32)
+    thin_prism = d[8:12].copy()
+    return radial, tangential, thin_prism
