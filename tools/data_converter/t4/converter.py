@@ -160,7 +160,10 @@ class T4Converter4(FileBasedDataConverter):
 
     def convert_sequence(self, sequence_id: str) -> None:
         sequence_path = Path(sequence_id)
+        # webauto layout is <annotation_dataset_id>/<version>; name such sequences "<id>_v<version>"
         sequence_name = sequence_path.name
+        if sequence_name.isdigit() and sequence_path.parent.name:
+            sequence_name = f"{sequence_path.parent.name}_v{sequence_name}"
         self.logger.info(f"Converting T4 sequence: {sequence_name}")
 
         # Lidar scan period drives the per-frame time window. Read from
@@ -307,7 +310,8 @@ class T4Converter4(FileBasedDataConverter):
         poses_writer.store_dynamic_pose(
             source_frame_id="rig",
             target_frame_id="world",
-            poses=T_rig_world.astype(np.float32),
+            # float64: T4 map coordinates are UTM-scale, float32 loses mm-level precision
+            poses=T_rig_world.astype(np.float64),
             timestamps_us=ego_timestamps_us,
         )
 
@@ -418,8 +422,9 @@ class T4Converter4(FileBasedDataConverter):
                 "intensity": PointCloudsComponent.AttributeSchema(
                     transform_type=PointCloud.AttributeTransformType.INVARIANT, dtype=np.dtype("uint8")
                 ),
+                # int16: T4 writes -1 when the ring is unknown
                 "ring": PointCloudsComponent.AttributeSchema(
-                    transform_type=PointCloud.AttributeTransformType.INVARIANT, dtype=np.dtype("uint16")
+                    transform_type=PointCloud.AttributeTransformType.INVARIANT, dtype=np.dtype("int16")
                 ),
             }
             if use_rebuilt:
@@ -482,16 +487,16 @@ class T4Converter4(FileBasedDataConverter):
                 point_timestamps_us = np.full(n_rays, ts_us, dtype=np.uint64)
                 frame_end_us = ts_us + np.uint64(scan_period_us - 1)
 
-            ring_u16 = (
-                np.clip(np.round(ring), 0, np.iinfo(np.uint16).max).astype(np.uint16)
+            ring_i16 = (
+                np.clip(np.round(ring), -1, np.iinfo(np.int16).max).astype(np.int16)
                 if ring is not None
-                else np.zeros(n_rays, dtype=np.uint16)
+                else np.full(n_rays, -1, dtype=np.int16)
             )
 
             if self.lidar_format == "point-cloud":
                 attributes = {
                     "intensity": np.clip(np.round(intensity_raw), 0, 255).astype(np.uint8),
-                    "ring": ring_u16,
+                    "ring": ring_i16,
                 }
                 if use_rebuilt:
                     attributes["timestamp_us"] = point_timestamps_us
@@ -516,7 +521,7 @@ class T4Converter4(FileBasedDataConverter):
                 distance_m=distance_m.reshape(1, -1),
                 intensity=intensity.reshape(1, -1),
                 frame_timestamps_us=np.array([ts_us, frame_end_us], dtype=np.uint64),
-                generic_data={"ring": ring_u16} if ring is not None else {},
+                generic_data={"ring": ring_i16} if ring is not None else {},
                 generic_meta_data=frame_meta,
             )
 
@@ -801,7 +806,7 @@ class T4Converter4(FileBasedDataConverter):
     default="ray-bundle",
     show_default=True,
     help="ray-bundle: NCore LidarSensorComponent (float32 direction/distance/intensity). "
-    "point-cloud: PointCloudsComponent with float32 xyz + uint8 intensity + uint16 ring (~30%% smaller).",
+    "point-cloud: PointCloudsComponent with float32 xyz + uint8 intensity + int16 ring (~30%% smaller).",
 )
 @click.option(
     "--jpeg-quality",

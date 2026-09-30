@@ -51,7 +51,7 @@ sequences side-by-side. Sensors can be subselected with the common
 |---|---|
 | `--keyframes-only` | only `is_key_frame` sample_data (gaussian_factory uses keyframes only) |
 | `--camera-id ...` | only the listed cameras (gaussian_factory uses 5, not `CAM_BACK`) |
-| `--lidar-format point-cloud` | `PointCloudsComponent` with float32 xyz + uint8 intensity + uint16 ring instead of the ray bundle (≈0.53× vs ≈0.74× of `.pcd.bin`) |
+| `--lidar-format point-cloud` | `PointCloudsComponent` with float32 xyz + uint8 intensity + int16 ring instead of the ray bundle (≈0.53× vs ≈0.74× of `.pcd.bin`) |
 | `--jpeg-quality Q` | lossy JPEG re-encode (source bytes are kept by default) |
 
 The rosbag (`input_bag/`) is never converted.

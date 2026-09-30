@@ -113,7 +113,7 @@ def make_t4_sequence(root: Path) -> Dict[str, Any]:
                 else:
                     pts = rng.normal(0, 10, (50, 5)).astype(np.float32)
                     pts[:, 3] = rng.integers(0, 256, 50)
-                    pts[:, 4] = rng.integers(0, 32, 50)
+                    pts[:, 4] = rng.integers(-1, 32, 50)  # -1 = unknown ring
                     pts[0, :3] = 0.0  # zero-range point is dropped
                     pts.tofile(root / fn)
                     lidar_points[fn] = pts
@@ -224,7 +224,7 @@ def _config(t4: Path, out: Path, **kwargs: Any) -> T4Converter4Config:
 
 
 def _open(out: Path) -> SequenceComponentGroupsReader:
-    seq_dir = out / "t4seq"
+    seq_dir = out / "t4seq"  # not a webauto <id>/<version> dir, so the name is kept
     return SequenceComponentGroupsReader([UPath(p) for p in sorted(seq_dir.glob("*.zarr"))])
 
 
@@ -272,7 +272,7 @@ class TestT4Converter(unittest.TestCase):
         direction = lidar.get_frame_ray_bundle_data(ts, "direction")
         distance = lidar.get_frame_ray_bundle_return_data(ts, "distance_m", 0)
         np.testing.assert_allclose(direction * distance[:, None], pts[:, :3], atol=1e-4)
-        np.testing.assert_array_equal(lidar.get_frame_generic_data(ts, "ring"), pts[:, 4].astype(np.uint16))
+        np.testing.assert_array_equal(lidar.get_frame_generic_data(ts, "ring"), pts[:, 4].astype(np.int16))
         meta = lidar.get_frame_generic_meta_data(ts)
         self.assertEqual(meta["t4_sample_data_token"], "sd_LIDAR_CONCAT_0")
         self.assertEqual(meta["t4_keyframe_index"], 0)
@@ -309,7 +309,7 @@ class TestT4Converter(unittest.TestCase):
         pts = self.lidar_points["data/LIDAR_CONCAT/00000.pcd.bin"][1:]
         np.testing.assert_array_equal(pcs.get_pc_xyz(0), pts[:, :3])
         np.testing.assert_array_equal(pcs.get_pc_attribute(0, "intensity"), pts[:, 3].astype(np.uint8))
-        np.testing.assert_array_equal(pcs.get_pc_attribute(0, "ring"), pts[:, 4].astype(np.uint16))
+        np.testing.assert_array_equal(pcs.get_pc_attribute(0, "ring"), pts[:, 4].astype(np.int16))
 
         labels = reader.open_component_readers(CameraLabelsComponent.Reader)
         self.assertEqual(
