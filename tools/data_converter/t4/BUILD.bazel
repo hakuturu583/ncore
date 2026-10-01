@@ -1,0 +1,110 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@ncore_pip_deps//:requirements.bzl", "requirement")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("//bazel/pytest:defs.bzl", "pytest_test")
+
+# T4-specific utilities: annotation tables, poses, distortion, lidar loading, image
+# re-encoding, sequence manifest
+py_library(
+    name = "pylib_utils",
+    srcs = ["utils.py"],
+    deps = [
+        requirement("numpy"),
+        requirement("pillow"),
+        requirement("universal_pathlib"),
+        "//ncore:pylib",
+    ],
+)
+
+# gaussian_factory artifact import (masks / depth -> camera labels, initial Gaussians -> point cloud)
+py_library(
+    name = "pylib_gaussian_factory",
+    srcs = ["gaussian_factory.py"],
+    deps = [
+        ":pylib_utils",
+        requirement("numpy"),
+        "//ncore:pylib",
+    ],
+)
+
+# Converter library (config, converter class, CLI registration)
+py_library(
+    name = "pylib",
+    srcs = ["converter.py"],
+    deps = [
+        ":pylib_utils",
+        requirement("click"),
+        requirement("numpy"),
+        requirement("scipy"),
+        requirement("tqdm"),
+        requirement("universal_pathlib"),
+        "//ncore:pylib",
+        "//tools/data_converter:pylib_cli",
+    ],
+)
+
+# Standalone CLI binary
+py_binary(
+    name = "convert",
+    srcs = ["main.py"],
+    main = "main.py",
+    deps = [":pylib"],
+)
+
+alias(
+    name = "t4",
+    actual = ":convert",
+)
+
+# Append gaussian_factory layers to a converted sequence as extra stores
+py_library(
+    name = "pylib_gf_append",
+    srcs = ["gf_append.py"],
+    deps = [
+        ":pylib_gaussian_factory",
+        ":pylib_utils",
+        requirement("click"),
+        requirement("numpy"),
+        requirement("tqdm"),
+        requirement("universal_pathlib"),
+        "//ncore:pylib",
+    ],
+)
+
+py_binary(
+    name = "gf_append",
+    srcs = ["gf_append.py"],
+    main = "gf_append.py",
+    deps = [":pylib_gf_append"],
+)
+
+# Storage breakdown: raw T4 vs gaussian_factory needs vs NCore output
+py_binary(
+    name = "storage_report",
+    srcs = ["storage_report.py"],
+    main = "storage_report.py",
+    deps = [
+        ":pylib_gaussian_factory",
+        ":pylib_utils",
+        requirement("click"),
+        requirement("numpy"),
+    ],
+)
+
+# Converter test on a synthetic T4 sequence (no external data needed)
+pytest_test(
+    name = "pytest_converter",
+    srcs = ["converter_test.py"],
+    python_versions = ["3.11"],
+    deps = [
+        ":pylib",
+        ":pylib_gaussian_factory",
+        ":pylib_gf_append",
+        requirement("numpy"),
+        requirement("pillow"),
+        requirement("universal_pathlib"),
+        "//ncore:pylib",
+    ],
+)
