@@ -156,10 +156,10 @@ def main(
         print(f"\ngaussian_factory output: {gf_root}  total {_fmt(gf_total).strip()}")
         gf_layers = {}
         for name, layer in GF_LAYERS.items():
-            size = _du(gf_root / layer.default_subdir)
+            size = _du(gf_root / layer.default_path)
             if size:
                 gf_layers[name] = size
-                print(_row(f"{name} ({layer.default_subdir})", size, gf_total))
+                print(_row(f"{name} ({layer.default_path})", size, gf_total))
         report["gf_total"] = gf_total
         report["gf_layers"] = gf_layers
 

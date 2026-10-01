@@ -29,6 +29,7 @@ from ncore.impl.data.v4.components import (
 )
 from tools.data_converter.t4.converter import T4Converter4, T4Converter4Config
 from tools.data_converter.t4.gaussian_factory import DEPTH_UINT16_SCALE_M
+from tools.data_converter.t4.gf_append import append_gf_layers
 from tools.data_converter.t4.utils import t4_distortion_to_opencv
 
 
@@ -174,12 +175,30 @@ def make_t4_sequence(root: Path) -> Dict[str, Any]:
     return {"sample_data": sample_data, "lidar_points": lidar_points}
 
 
+def write_gaussians_ply(path: Path, n: int, rng: np.random.Generator) -> np.ndarray:
+    """Writes a binary 3DGS-style PLY (as gaussian_factory's save_3dgs_ply) and returns its vertices."""
+    names = ["x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2", "f_rest_0", "f_rest_1", "f_rest_2"]
+    names += ["opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"]
+    vertices = np.empty(n, dtype=[(name, "<f4") for name in names])
+    for name in names:
+        vertices[name] = rng.normal(size=n).astype(np.float32)
+    vertices["x"] += 89_000.0  # UTM-scale world coordinates
+    header = "ply\nformat binary_little_endian 1.0\ncomment gaussian_factory\n"
+    header += f"element vertex {n}\n" + "".join(f"property float {name}\n" for name in names) + "end_header\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
+        f.write(header.encode("ascii"))
+        vertices.tofile(f)
+    return vertices
+
+
 def make_gf_outputs(gf: Path, sample_data: List[dict]) -> Dict[str, Any]:
-    """Writes gaussian_factory artifacts for the keyframe camera frames."""
+    """Writes gaussian_factory artifacts (default layout) for the keyframe camera frames."""
     rng = np.random.default_rng(1)
     expected: Dict[str, Any] = {}
-    poses = {}
     keyframes = [sd for sd in sample_data if sd["is_key_frame"] and not sd["filename"].startswith("data/LIDAR")]
+    ma_dir = gf / "mapanything_init_v14b" / "view_depth_masked"
+    ma_dir.mkdir(parents=True, exist_ok=True)
     for sd in keyframes:
         ch = sd["filename"].split("/")[1]
         stem = Path(sd["filename"]).stem
@@ -193,14 +212,10 @@ def make_gf_outputs(gf: Path, sample_data: List[dict]) -> Dict[str, Any]:
             PILImage.fromarray(arr, "L").save(gf / sub / ch / f"{stem}.png")
         (gf / "lidar_depth_accum" / ch).mkdir(parents=True, exist_ok=True)
         np.save(gf / "lidar_depth_accum" / ch / f"frame_{kf:04d}.npy", depth)
-        (gf / "ma" / "view_depth").mkdir(parents=True, exist_ok=True)
-        np.save(gf / "ma" / "view_depth" / f"{sd['token']}.npy", ma_depth)
-        c2w = np.eye(4)
-        c2w[:3, 3] = rng.normal(size=3)
-        poses[sd["token"]] = c2w.tolist()
-        expected[sd["token"]] = {"instance": inst, "sky": sky, "lidar_depth": depth, "ma": ma_depth, "c2w": c2w}
+        np.save(ma_dir / f"{sd['token']}.npy", ma_depth)
+        expected[sd["token"]] = {"instance": inst, "sky": sky, "lidar_depth": depth, "ma": ma_depth}
     _write_json(gf / "sam_masks" / "track_id_mapping.json", {"inst0": 1})
-    _write_json(gf / "refined_poses_step000100.json", {"meta": {"step": 100}, "poses": poses})
+    expected["gaussians"] = write_gaussians_ply(gf / "mapanything_init_v14b" / "initial_gaussians.ply", 100, rng)
     return expected
 
 
@@ -224,8 +239,9 @@ def _config(t4: Path, out: Path, **kwargs: Any) -> T4Converter4Config:
 
 
 def _open(out: Path) -> SequenceComponentGroupsReader:
-    seq_dir = out / "t4seq"  # not a webauto <id>/<version> dir, so the name is kept
-    return SequenceComponentGroupsReader([UPath(p) for p in sorted(seq_dir.glob("*.zarr"))])
+    # the sequence meta JSON is the store manifest (base conversion + appended layers);
+    # "t4seq" is not a webauto <id>/<version> dir, so the name is kept
+    return SequenceComponentGroupsReader([UPath(out / "t4seq" / "t4seq.json")])
 
 
 class TestT4Converter(unittest.TestCase):
@@ -287,23 +303,20 @@ class TestT4Converter(unittest.TestCase):
         levels = cast(List[str], cuboids.generic_meta_data["t4_visibility_levels"])
         self.assertEqual([levels[i] for i in cuboids.get_generic_data("t4_visibility_index")], ["none", "full", "full"])
 
-    def test_gaussian_factory_keyframes_point_cloud(self) -> None:
+    def test_gaussian_factory_append(self) -> None:
         out = self.tmp / "out_gf"
-        T4Converter4.convert(
-            _config(
-                self.t4,
-                out,
-                keyframes_only=True,
-                lidar_format="point-cloud",
-                gf_root=str(self.gf),
-                gf_layer_dirs=(f"mapanything_depth={self.gf / 'ma' / 'view_depth'}",),
-                gf_camera_poses_json=str(self.gf / "refined_poses_step000100.json"),
-            )
-        )
+        T4Converter4.convert(_config(self.t4, out, keyframes_only=True, lidar_format="point-cloud"))
+        seq_dir = out / "t4seq"
+        base_stores = sorted(p.name for p in seq_dir.glob("*.zarr"))
+
         reader = _open(out)
+        # sequence meta must be invariant so later stores can join the sequence
+        self.assertEqual(
+            sorted(reader.generic_meta_data), ["source_format", "t4_log_token", "t4_scene_name", "t4_scene_token"]
+        )
         cams = reader.open_component_readers(CameraSensorComponent.Reader)
         self.assertEqual(cams["CAM_FRONT"].frames_count, N_SAMPLES)
-
+        self.assertTrue(cams["CAM_FRONT"].generic_meta_data["t4_keyframes_only"])
         pcs = reader.open_component_readers(PointCloudsComponent.Reader)["LIDAR_CONCAT"]
         self.assertEqual(pcs.pcs_count, N_SAMPLES)
         pts = self.lidar_points["data/LIDAR_CONCAT/00000.pcd.bin"][1:]
@@ -311,6 +324,25 @@ class TestT4Converter(unittest.TestCase):
         np.testing.assert_array_equal(pcs.get_pc_attribute(0, "intensity"), pts[:, 3].astype(np.uint8))
         np.testing.assert_array_equal(pcs.get_pc_attribute(0, "ring"), pts[:, 4].astype(np.int16))
 
+        # stage 1: masks only (as after gf-generate-masks / gf-generate-sky-masks)
+        stored = append_gf_layers(seq_dir, self.gf, ["instance", "sky"], store_type="directory")
+        self.assertEqual(stored, {"instance": 2 * N_SAMPLES, "sky": 2 * N_SAMPLES})
+        labels = _open(out).open_component_readers(CameraLabelsComponent.Reader)
+        self.assertEqual(
+            sorted(labels), sorted(f"{k}@{c}" for k in ("segmentation.instance", "mask.sky") for c in CAMERAS)
+        )
+
+        # stage 2: everything found under the gaussian_factory root (masks are replaced, not duplicated)
+        stored = append_gf_layers(seq_dir, self.gf, store_type="directory")
+        self.assertEqual(sorted(stored), ["init_gaussians", "instance", "lidar_depth", "mapanything_depth", "sky"])
+        stores = sorted(p.name for p in seq_dir.glob("*.zarr"))
+        self.assertEqual(
+            sorted(set(stores) - set(base_stores)),
+            sorted(f"t4seq.ncore4-gf_{n}.zarr" for n in stored),
+        )
+        self.assertEqual(list(seq_dir.glob(".gf_append_*")), [])
+
+        reader = _open(out)
         labels = reader.open_component_readers(CameraLabelsComponent.Reader)
         self.assertEqual(
             sorted(labels),
@@ -337,26 +369,25 @@ class TestT4Converter(unittest.TestCase):
                 else:
                     np.testing.assert_allclose(data, exp["ma"], atol=DEPTH_UINT16_SCALE_M / 2 + 1e-6)
 
-        gf_poses = reader.open_component_readers(PosesComponent.Reader)["gaussian_factory"]
-        poses, ts = gf_poses.get_dynamic_pose("CAM_FRONT", "world")
-        self.assertEqual(len(ts), N_SAMPLES)
-        np.testing.assert_allclose(poses[0], self.expected["sd_CAM_FRONT_0"]["c2w"])
+        gaussians = reader.open_component_readers(PointCloudsComponent.Reader)["gf_init_gaussians"]
+        exp_g = self.expected["gaussians"]
+        np.testing.assert_array_equal(gaussians.get_pc_xyz(0), np.stack([exp_g["x"], exp_g["y"], exp_g["z"]], axis=1))
+        for prop in ("f_dc_0", "f_rest_2", "opacity", "scale_1", "rot_3"):
+            np.testing.assert_array_equal(gaussians.get_pc_attribute(0, prop), exp_g[prop])
+        self.assertEqual(gaussians.get_pc_reference_frame_id(0), "world")
 
-    def test_gaussian_factory_float32_depth(self) -> None:
-        out = self.tmp / "out_gf_f32"
-        T4Converter4.convert(
-            _config(
-                self.t4,
-                out,
-                keyframes_only=True,
-                gf_root=str(self.gf),
-                gf_layers=("lidar_depth",),
-                gf_depth_encoding="float32",
-            )
-        )
+    def test_gaussian_factory_append_replaces_layer(self) -> None:
+        out = self.tmp / "out_gf_replace"
+        T4Converter4.convert(_config(self.t4, out, keyframes_only=True))
+        seq_dir = out / "t4seq"
+        append_gf_layers(seq_dir, self.gf, ["lidar_depth"], store_type="directory")
+        # re-run the layer losslessly, e.g. after regenerating it: the store is swapped in place
+        append_gf_layers(seq_dir, self.gf, ["lidar_depth"], depth_encoding="float32", store_type="directory")
+        self.assertEqual(len(list(seq_dir.glob("*gf_lidar_depth*"))), 1)
         labels = _open(out).open_component_readers(CameraLabelsComponent.Reader)
         self.assertEqual(sorted(labels), [f"depth.z_lidar_accum@{c}" for c in sorted(CAMERAS)])
         lr = labels["depth.z_lidar_accum@CAM_BACK"]
+        self.assertEqual(lr.generic_meta_data["gf_depth_encoding"], "float32")
         handle = lr.get_label(int(lr.timestamps_us[0]))
         exp = self.expected[str(handle.generic_meta_data["t4_sample_data_token"])]
         np.testing.assert_array_equal(handle.get_data(), exp["lidar_depth"])

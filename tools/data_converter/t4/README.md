@@ -5,10 +5,11 @@ SPDX-License-Identifier: Apache-2.0
 
 # T4 Dataset Converter
 
-Convert a TIER IV T4 dataset into NCore V4 component stores, optionally together
-with the per-frame artifacts produced by
-[gaussian_factory](https://github.com/hakuturu583/gaussian_factory) (masks, depth,
-refined poses), so that the raw T4 tree can be replaced by a smaller NCore sequence.
+Convert a TIER IV T4 dataset into NCore V4 component stores, and append the
+preprocessing artifacts of
+[gaussian_factory](https://github.com/hakuturu583/gaussian_factory) that its streaming
+trainer consumes (masks, depth, initial Gaussians), so that the raw T4 tree can be
+replaced by a smaller NCore sequence.
 
 ## Frame mapping
 
@@ -56,37 +57,52 @@ sequences side-by-side. Sensors can be subselected with the common
 
 The rosbag (`input_bag/`) is never converted.
 
-### gaussian_factory artifacts
+### gaussian_factory layers (appended afterwards)
 
-`--gf-root <gaussian_factory output root of the scene>` imports every layer found
-there as `CameraLabelsComponent` instances (one store per layer, so a layer can be
-dropped or shipped separately):
+NCore V4 stores are write-once, but a sequence is a *set* of stores sharing
+`sequence_id`, time interval and sequence meta-data. The base conversion therefore keeps
+the sequence meta-data invariant (T4 identifiers only; conversion options live in the
+component meta-data), and each gaussian_factory layer is appended later as its own
+store `<sequence_id>.ncore4-gf_<layer>.zarr.itar`, e.g. right after the pipeline step that
+produced it:
 
-| layer | source (default subdir) | key | NCore label |
+```bash
+python -m tools.data_converter.t4.gf_append --sequence-dir $OUT/<sequence_id> \
+    --gf-root $GF_ROOT [--layer sky --layer instance] [--layer-path NAME=PATH]
+```
+
+Re-appending a layer replaces its store. The sequence meta JSON `<sequence_id>.json` is
+rewritten as the store manifest, so opening it with `SequenceComponentGroupsReader`
+yields the base conversion plus every appended layer. Appending needs only the NCore
+sequence and the gaussian_factory output (frames are matched via the T4 provenance in the
+camera frame meta-data), not the raw T4 tree.
+
+Only what `train_static_near_streaming` reads is covered:
+
+| layer | source (default under `--gf-root`) | key | NCore |
 |---|---|---|---|
-| `instance` | `sam_masks/<CAM>/<stem>.png` (+`track_id_mapping.json`) | image stem | `segmentation.instance@<CAM>`, PNG uint8 |
-| `sky` | `sky_masks/<CAM>/<stem>.png` | image stem | `mask.sky@<CAM>`, PNG uint8 (255=sky) |
-| `lidar_depth` | `lidar_depth_accum/<CAM>/frame_NNNN.npy` | keyframe ordinal | `depth.z_lidar_accum@<CAM>` |
-| `mapanything_depth` | `mapanything_init_v14b/view_depth/<sd_token>.npy` | sample_data token | `depth.z_mapanything@<CAM>` |
+| `instance` | `sam_masks/<CAM>/<stem>.png` (+`track_id_mapping.json`) | image stem | label `segmentation.instance@<CAM>`, PNG uint8 |
+| `sky` | `sky_masks/<CAM>/<stem>.png` | image stem | label `mask.sky@<CAM>`, PNG uint8 (255=sky) |
+| `lidar_depth` | `lidar_depth_accum/<CAM>/frame_NNNN.npy` | keyframe ordinal | label `depth.z_lidar_accum@<CAM>` |
+| `mapanything_depth` | `mapanything_init_v14b/view_depth_masked/<sd_token>.npy` | sample_data token | label `depth.z_mapanything@<CAM>` |
+| `init_gaussians` | `mapanything_init_v14b/initial_gaussians.ply` | - | point cloud `gf_init_gaussians` (world frame, every PLY property as an attribute) |
 
-- `--gf-layer NAME` restricts the import, `--gf-layer-dir NAME=PATH` overrides a directory.
 - Depth is stored as uint16 in 1/256 m steps (range 256 m, 0 = invalid) by default;
-  `--gf-depth-encoding float32` stores it losslessly.
-- PNGs are losslessly re-optimized (`--no-gf-png-reoptimize` keeps source bytes).
-- `--gf-camera-poses-json` (`trajectory_correction/poses.json` or the trainer's
-  `refined_poses_step*.json`, `{sample_data_token: camera->world}`) is stored as
-  dynamic `<CAM> -> world` poses of a separate `gaussian_factory` poses component.
+  `--depth-encoding float32` stores it losslessly.
+- PNGs are losslessly re-optimized (`--no-png-reoptimize` keeps source bytes).
+- Labels use the camera frame timestamp and carry their `t4_sample_data_token`.
+- Not covered (not read by the streaming trainer, or rebuilt by it): static mesh,
+  quadmask / inpainting, dynamic_objects_v2, near masks, ground-cloud / visibility-voxel /
+  VAD caches, cuVSLAM / refined poses.
 
-Labels use the camera frame timestamp; each label also carries its
-`t4_sample_data_token`.
-
-Typical gaussian_factory export:
+Typical gaussian_factory flow:
 
 ```bash
 python -m tools.data_converter.t4.main --root-dir $T4 --output-dir $OUT \
     --camera-id CAM_FRONT --camera-id CAM_FRONT_LEFT --camera-id CAM_FRONT_RIGHT \
     --camera-id CAM_BACK_LEFT --camera-id CAM_BACK_RIGHT \
-    t4-v4 --keyframes-only --lidar-format point-cloud --gf-root $GF_ROOT
+    t4-v4 --lidar-format point-cloud
+python -m tools.data_converter.t4.gf_append --sequence-dir $OUT/<sequence_id> --gf-root $GF_ROOT
 ```
 
 ### Storage report

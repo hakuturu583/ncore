@@ -8,9 +8,9 @@ T4 ``base_link`` and ``map`` frames map to NCore ``rig`` and ``world``.
 ``T_baselink_map``; both match NCore's source->target convention with no
 inversion needed.
 
-Optionally imports gaussian_factory per-frame artifacts (instance / sky masks,
-accumulated LiDAR depth, MapAnything depth, refined camera poses) so that the
-raw T4 tree can be replaced by the NCore sequence.
+gaussian_factory preprocessing artifacts are added afterwards as extra component
+stores of the same sequence (see ``gf_append.py``), so the sequence-level meta-data
+written here must stay invariant: only T4 identifiers, no conversion options.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import logging
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, Literal, Optional
 
 import click
 import numpy as np
@@ -42,7 +42,6 @@ from ncore.impl.data.types import (
     ShutterType,
 )
 from ncore.impl.data.v4.components import (
-    CameraLabelsComponent,
     CameraSensorComponent,
     CuboidsComponent,
     IntrinsicsComponent,
@@ -56,14 +55,6 @@ from ncore.impl.data.v4.components import (
 from ncore.impl.data.v4.types import ComponentGroupAssignments
 from ncore.impl.data_converter.base import FileBasedDataConverter, FileBasedDataConverterConfig
 from tools.data_converter.cli import cli
-from tools.data_converter.t4.gaussian_factory import (
-    GF_LAYERS,
-    CameraFrameRef,
-    DepthEncoding,
-    GfLayerImporter,
-    load_camera_poses_json,
-    resolve_layers,
-)
 from tools.data_converter.t4.utils import (
     index_by_token,
     keyframe_index_by_sample_token,
@@ -99,14 +90,6 @@ class T4Converter4Config(FileBasedDataConverterConfig):
     jpeg_quality: Optional[int] = None  # re-encode camera JPEGs at this quality (lossy); None keeps source bytes
     include_lanelet2_map: bool = True  # embed map/lanelet2_map.osm (if present) as poses generic data
 
-    ## gaussian_factory artifacts
-    gf_root: Optional[str] = None  # gaussian_factory output root of this scene (holds sam_masks/, sky_masks/, ...)
-    gf_layers: Tuple[str, ...] = ()  # subset of layers to import (all found if empty)
-    gf_layer_dirs: Tuple[str, ...] = ()  # NAME=PATH overrides of layer directories
-    gf_depth_encoding: DepthEncoding = "uint16"
-    gf_png_reoptimize: bool = True
-    gf_camera_poses_json: Optional[str] = None  # {sample_data_token: 4x4 camera->world} (cuVSLAM / refined poses)
-
 
 class T4Converter4(FileBasedDataConverter):
     """T4 dataset to NCore V4 converter."""
@@ -128,17 +111,6 @@ class T4Converter4(FileBasedDataConverter):
         self.lidar_format: LidarFormat = config.lidar_format
         self.jpeg_quality = config.jpeg_quality
         self.include_lanelet2_map = config.include_lanelet2_map
-        self.gf_root = Path(config.gf_root) if config.gf_root else None
-        self.gf_layers = list(config.gf_layers)
-        self.gf_layer_dirs: Dict[str, Path] = {}
-        for spec in config.gf_layer_dirs:
-            name, sep, path = spec.partition("=")
-            if not sep:
-                raise ValueError(f"--gf-layer-dir expects NAME=PATH, got {spec!r}")
-            self.gf_layer_dirs[name] = Path(path)
-        self.gf_depth_encoding: DepthEncoding = config.gf_depth_encoding
-        self.gf_png_reoptimize = config.gf_png_reoptimize
-        self.gf_camera_poses_json = Path(config.gf_camera_poses_json) if config.gf_camera_poses_json else None
         self.logger = logging.getLogger(__name__)
 
     @staticmethod
@@ -245,30 +217,14 @@ class T4Converter4(FileBasedDataConverter):
             ego_timestamps_us = np.concatenate([ego_timestamps_us, np.array([seq_end_us_inclusive], dtype=np.uint64)])
             T_rig_world = np.concatenate([T_rig_world, T_rig_world[-1:]], axis=0)
 
-        gf_importers = resolve_layers(
-            self.gf_root, self.gf_layers, self.gf_layer_dirs, self.gf_depth_encoding, self.gf_png_reoptimize
-        )
-        # (importer, camera_id) -> camera label instance name
-        gf_label_instances: Dict[Tuple[str, str], str] = {}
-        for importer in gf_importers:
-            for camera_id in camera_ids:
-                if importer.has_camera(camera_id):
-                    gf_label_instances[(importer.layer.name, camera_id)] = importer.descriptor(
-                        camera_id
-                    ).default_instance_name
-
         point_cloud_lidar_ids = lidar_ids if self.lidar_format == "point-cloud" else []
         component_groups = ComponentGroupAssignments.create(
             camera_ids=camera_ids,
             lidar_ids=[] if self.lidar_format == "point-cloud" else lidar_ids,
             radar_ids=[],
             point_clouds_ids=point_cloud_lidar_ids,
-            camera_labels_ids=list(gf_label_instances.values()),
+            camera_labels_ids=[],
             profile=self.component_group_profile,
-            # one store per gaussian_factory layer, so layers can be dropped / shipped independently
-            camera_labels_component_groups={
-                instance: f"gf_{layer_name}" for (layer_name, _), instance in gf_label_instances.items()
-            },
         )
 
         sequence_meta: Dict[str, JsonLike] = {
@@ -276,10 +232,6 @@ class T4Converter4(FileBasedDataConverter):
             "t4_scene_token": scene["token"],
             "t4_scene_name": scene.get("name", ""),
             "t4_log_token": scene["log_token"],
-            "t4_keyframes_only": self.keyframes_only,
-            "t4_lidar_format": self.lidar_format,
-            "t4_jpeg_quality": self.jpeg_quality,
-            "gf_layers": list(sorted({layer for layer, _ in gf_label_instances})),
         }
         store_writer = SequenceComponentGroupsWriter(
             output_dir_path=UPath(self.output_dir) / sequence_name,
@@ -345,9 +297,8 @@ class T4Converter4(FileBasedDataConverter):
                 scan_period_us=lidar_scan_period_us,
             )
 
-        camera_frames: Dict[str, List[CameraFrameRef]] = {}
         for camera_id in camera_ids:
-            camera_frames[camera_id] = self._convert_camera(
+            self._convert_camera(
                 camera_id=camera_id,
                 sequence_path=sequence_path,
                 sample_data=sample_data_by_channel[camera_id],
@@ -359,12 +310,6 @@ class T4Converter4(FileBasedDataConverter):
                 masks_writer=masks_writer,
                 component_groups=component_groups,
             )
-
-        for importer in gf_importers:
-            self._convert_gf_layer(importer, camera_frames, gf_label_instances, store_writer, component_groups)
-
-        if self.gf_camera_poses_json is not None:
-            self._convert_gf_camera_poses(camera_frames, store_writer, component_groups)
 
         if tables["sample_annotation"]:
             self._convert_cuboids(
@@ -435,7 +380,12 @@ class T4Converter4(FileBasedDataConverter):
                 PointCloudsComponent.Writer,
                 component_instance_name=lidar_id,
                 group_name=component_groups.point_clouds_component_groups.get(lidar_id),
-                generic_meta_data={"source": "t4:lidar", "intensity_range": [0, 255]},
+                generic_meta_data={
+                    "source": "t4:lidar",
+                    "intensity_range": [0, 255],
+                    "t4_lidar_format": self.lidar_format,
+                    "t4_keyframes_only": self.keyframes_only,
+                },
                 coordinate_unit=PointCloud.CoordinateUnit.METERS,
                 attribute_schemas=attribute_schemas,
             )
@@ -444,7 +394,7 @@ class T4Converter4(FileBasedDataConverter):
                 LidarSensorComponent.Writer,
                 component_instance_name=lidar_id,
                 group_name=component_groups.lidar_component_groups.get(lidar_id),
-                generic_meta_data={},
+                generic_meta_data={"t4_lidar_format": self.lidar_format, "t4_keyframes_only": self.keyframes_only},
             )
 
         for sd in tqdm.tqdm(sample_data, desc=f"lidar {lidar_id}"):
@@ -546,7 +496,7 @@ class T4Converter4(FileBasedDataConverter):
         intrinsics_writer: IntrinsicsComponent.Writer,
         masks_writer: MasksComponent.Writer,
         component_groups: ComponentGroupAssignments,
-    ) -> List[CameraFrameRef]:
+    ) -> None:
         calib = calibrated_by_token[sample_data[0]["calibrated_sensor_token"]]
         T_sensor_rig = t4_pose_to_se3(calib["translation"], calib["rotation"])
         poses_writer.store_static_pose(
@@ -569,10 +519,9 @@ class T4Converter4(FileBasedDataConverter):
             CameraSensorComponent.Writer,
             component_instance_name=camera_id,
             group_name=component_groups.camera_component_groups.get(camera_id),
-            generic_meta_data={},
+            generic_meta_data={"t4_jpeg_quality": self.jpeg_quality, "t4_keyframes_only": self.keyframes_only},
         )
 
-        frames: List[CameraFrameRef] = []
         for sd in tqdm.tqdm(sample_data, desc=f"camera {camera_id}"):
             img_path = sequence_path / sd["filename"]
             with img_path.open("rb") as f:
@@ -585,15 +534,6 @@ class T4Converter4(FileBasedDataConverter):
                 frame_timestamps_us=np.array([ts_us, ts_us], dtype=np.uint64),
                 generic_data={},
                 generic_meta_data=frame_meta,
-            )
-            frames.append(
-                CameraFrameRef(
-                    camera_id=camera_id,
-                    timestamp_us=int(ts_us),
-                    sample_data_token=sd["token"],
-                    image_stem=Path(sd["filename"]).stem,
-                    keyframe_index=keyframe_index.get(sd.get("sample_token", "")) if sd.get("is_key_frame") else None,
-                )
             )
 
         intrinsics_writer.store_camera_intrinsics(
@@ -610,88 +550,6 @@ class T4Converter4(FileBasedDataConverter):
             ),
         )
         masks_writer.store_camera_masks(camera_id=camera_id, mask_images={})
-        return frames
-
-    def _convert_gf_layer(
-        self,
-        importer: GfLayerImporter,
-        camera_frames: Dict[str, List[CameraFrameRef]],
-        gf_label_instances: Dict[Tuple[str, str], str],
-        store_writer: SequenceComponentGroupsWriter,
-        component_groups: ComponentGroupAssignments,
-    ) -> None:
-        layer = importer.layer
-        component_meta = importer.component_meta()
-        for camera_id, frames in camera_frames.items():
-            instance = gf_label_instances.get((layer.name, camera_id))
-            if instance is None:
-                continue
-            writer = store_writer.register_component_writer(
-                CameraLabelsComponent.Writer,
-                component_instance_name=instance,
-                group_name=component_groups.camera_labels_component_groups.get(instance),
-                generic_meta_data=component_meta,
-                descriptor=importer.descriptor(camera_id),
-            )
-            n_stored = n_missing = 0
-            for frame in tqdm.tqdm(frames, desc=f"gf {layer.name} {camera_id}"):
-                path = importer.path_for(frame)
-                if path is None or not path.is_file():
-                    n_missing += 1
-                    continue
-                writer.store_label(
-                    importer.load(path),
-                    timestamp_us=frame.timestamp_us,
-                    generic_meta_data={"t4_sample_data_token": frame.sample_data_token},
-                )
-                n_stored += 1
-            self.logger.info(
-                f"gaussian_factory {layer.name}@{camera_id}: stored {n_stored}, no artifact for {n_missing} frames"
-            )
-        if importer.n_depth_clipped:
-            self.logger.warning(
-                f"gaussian_factory {layer.name}: {importer.n_depth_clipped} depth px beyond uint16 range set invalid"
-            )
-
-    def _convert_gf_camera_poses(
-        self,
-        camera_frames: Dict[str, List[CameraFrameRef]],
-        store_writer: SequenceComponentGroupsWriter,
-        component_groups: ComponentGroupAssignments,
-    ) -> None:
-        """Store gaussian_factory camera->world poses as a separate ``gaussian_factory`` poses instance."""
-        assert self.gf_camera_poses_json is not None
-        poses_by_token, meta = load_camera_poses_json(self.gf_camera_poses_json)
-        poses_meta: Dict[str, JsonLike] = {
-            "producer": "gaussian_factory",
-            "source_file": self.gf_camera_poses_json.name,
-            "description": "per-camera-frame camera->world (T4 map) poses, OpenCV camera axes",
-            "gf_meta": meta,
-        }
-        writer = store_writer.register_component_writer(
-            PosesComponent.Writer,
-            component_instance_name="gaussian_factory",
-            group_name=component_groups.poses_component_group,
-            generic_meta_data=poses_meta,
-        )
-        for camera_id, frames in camera_frames.items():
-            matched = [
-                (f.timestamp_us, poses_by_token[f.sample_data_token])
-                for f in frames
-                if f.sample_data_token in poses_by_token
-            ]
-            if len(matched) < 2:
-                self.logger.warning(f"gaussian_factory poses {camera_id}: {len(matched)} matched frame(s), skipping")
-                continue
-            writer.store_dynamic_pose(
-                source_frame_id=camera_id,
-                target_frame_id="world",
-                poses=np.stack([m[1] for m in matched]).astype(np.float64),
-                timestamps_us=np.array([m[0] for m in matched], dtype=np.uint64),
-                # gaussian_factory only estimates poses at (key)frame times
-                require_sequence_time_coverage=False,
-            )
-            self.logger.info(f"gaussian_factory poses {camera_id}: {len(matched)}/{len(frames)} frames")
 
     def _convert_cuboids(
         self,
@@ -815,46 +673,8 @@ class T4Converter4(FileBasedDataConverter):
     help="Re-encode camera JPEGs at this quality (lossy). Default keeps the source bytes.",
 )
 @click.option("--lanelet2-map/--no-lanelet2-map", "include_lanelet2_map", default=True, show_default=True)
-@click.option(
-    "--gf-root",
-    type=str,
-    default=None,
-    help="gaussian_factory output root of this scene (containing sam_masks/, sky_masks/, lidar_depth_accum/, ...). "
-    "Every layer found there is imported as NCore camera labels.",
-)
-@click.option(
-    "--gf-layer",
-    "gf_layers",
-    multiple=True,
-    type=click.Choice(sorted(GF_LAYERS)),
-    help="Restrict to these gaussian_factory layers (multiple; default: all found).",
-)
-@click.option(
-    "--gf-layer-dir",
-    "gf_layer_dirs",
-    multiple=True,
-    type=str,
-    help="Override a layer directory as NAME=PATH (multiple), e.g. mapanything_depth=/run/ma/view_depth.",
-)
-@click.option(
-    "--gf-depth-encoding",
-    type=click.Choice(["uint16", "float32"]),
-    default="uint16",
-    show_default=True,
-    help="uint16 quantizes depth to 1/256 m (range 256 m); float32 is lossless.",
-)
-@click.option("--gf-png-reoptimize/--no-gf-png-reoptimize", default=True, show_default=True)
-@click.option(
-    "--gf-camera-poses-json",
-    type=str,
-    default=None,
-    help="gaussian_factory {sample_data_token: camera->world} poses (trajectory_correction/poses.json or "
-    "refined_poses_step*.json), stored as a 'gaussian_factory' poses component.",
-)
 @click.pass_context
 def t4_v4(ctx, *_, **kwargs):
     """T4 dataset conversion (V4 format)"""
-    kwargs["gf_layers"] = tuple(kwargs["gf_layers"])
-    kwargs["gf_layer_dirs"] = tuple(kwargs["gf_layer_dirs"])
     config = T4Converter4Config(**{**vars(ctx.obj), **kwargs})
     T4Converter4.convert(config)

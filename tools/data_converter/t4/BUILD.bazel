@@ -56,6 +56,21 @@ alias(
     actual = ":convert",
 )
 
+# Append gaussian_factory layers to a converted sequence as extra stores
+py_binary(
+    name = "gf_append",
+    srcs = ["gf_append.py"],
+    main = "gf_append.py",
+    deps = [
+        ":pylib_gaussian_factory",
+        requirement("click"),
+        requirement("numpy"),
+        requirement("tqdm"),
+        requirement("universal_pathlib"),
+        "//ncore:pylib",
+    ],
+)
+
 # Storage breakdown: raw T4 vs gaussian_factory needs vs NCore output
 py_binary(
     name = "storage_report",
@@ -73,10 +88,16 @@ py_binary(
 # Converter test on a synthetic T4 sequence (no external data needed)
 pytest_test(
     name = "pytest_converter",
-    srcs = ["converter_test.py"],
+    srcs = [
+        "converter_test.py",
+        "gf_append.py",
+    ],
     python_versions = ["3.11"],
     deps = [
         ":pylib",
+        ":pylib_gaussian_factory",
+        requirement("click"),
+        requirement("tqdm"),
         requirement("numpy"),
         requirement("pillow"),
         requirement("universal_pathlib"),

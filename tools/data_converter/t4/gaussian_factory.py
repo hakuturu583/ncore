@@ -1,17 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Import gaussian_factory per-frame derived artifacts into NCore camera labels.
+"""gaussian_factory preprocessing artifacts and how they map onto NCore components.
 
-gaussian_factory (3DGS reconstruction over T4 logs) writes several per-camera-frame
-artifacts next to the raw T4 dataset. Storing them inside the NCore sequence lets the
-raw T4 tree be dropped. Each artifact is described by a :class:`GfLayer`; files are
-located by one of three key schemes used by gaussian_factory:
+Only what ``train_static_near_streaming`` consumes is covered (masks / depth as camera
+labels, the MapAnything initial Gaussians as a point cloud). Each artifact is a
+:class:`GfLayer`; per-frame files are located by one of three key schemes used by
+gaussian_factory:
 
 - ``stem``: ``<layer_dir>/<CAM>/<image_stem><suffix>`` (image filename stem)
 - ``keyframe_index``: ``<layer_dir>/<CAM>/frame_{keyframe_index:04d}<suffix>``
   (ordinal of the ``sample`` in the scene's linked list)
 - ``sd_token``: ``<layer_dir>/<sample_data_token><suffix>`` (no camera subdir)
+
+The frame identity (timestamp, sample_data token, image stem, keyframe index) comes from
+the camera frames' generic meta-data of an already converted NCore sequence, so layers can
+be appended without the raw T4 tree.
 """
 
 from __future__ import annotations
@@ -43,7 +47,7 @@ from ncore.impl.data.types import (
 
 logger = logging.getLogger(__name__)
 
-KeyScheme = Literal["stem", "keyframe_index", "sd_token"]
+KeyScheme = Literal["stem", "keyframe_index", "sd_token", "none"]
 DepthEncoding = Literal["float32", "uint16"]
 
 # uint16 depth quantization: 1/256 m (~3.9 mm) steps, 0..255.996 m range. Well below
@@ -53,15 +57,15 @@ DEPTH_UINT16_SCALE_M: float = 1.0 / 256.0
 
 @dataclass(frozen=True)
 class GfLayer:
-    """One gaussian_factory artifact type and how it maps to an NCore camera label."""
+    """One gaussian_factory artifact type and how it maps to an NCore component."""
 
-    name: str  # CLI / instance-name identifier
-    default_subdir: str  # relative to the gaussian_factory output root
+    name: str  # CLI identifier, also names the store group ``gf_<name>``
+    default_path: str  # relative to the gaussian_factory output root (dir, or file for "gaussians")
     key: KeyScheme
     suffix: str
-    kind: Literal["png", "depth"]
-    label_type: LabelType
+    kind: Literal["png", "depth", "gaussians"]
     description: str
+    label_type: Optional[LabelType] = None  # camera-label layers only
     # side-car JSON files (relative to the layer dir) copied into the component meta-data
     sidecar_json: tuple[str, ...] = ()
 
@@ -71,7 +75,7 @@ GF_LAYERS: Dict[str, GfLayer] = {
     for layer in (
         GfLayer(
             name="instance",
-            default_subdir="sam_masks",
+            default_path="sam_masks",
             key="stem",
             suffix=".png",
             kind="png",
@@ -82,7 +86,7 @@ GF_LAYERS: Dict[str, GfLayer] = {
         ),
         GfLayer(
             name="sky",
-            default_subdir="sky_masks",
+            default_path="sky_masks",
             key="stem",
             suffix=".png",
             kind="png",
@@ -92,7 +96,7 @@ GF_LAYERS: Dict[str, GfLayer] = {
         ),
         GfLayer(
             name="lidar_depth",
-            default_subdir="lidar_depth_accum",
+            default_path="lidar_depth_accum",
             key="keyframe_index",
             suffix=".npy",
             kind="depth",
@@ -101,12 +105,21 @@ GF_LAYERS: Dict[str, GfLayer] = {
         ),
         GfLayer(
             name="mapanything_depth",
-            default_subdir="mapanything_init_v14b/view_depth",
+            default_path="mapanything_init_v14b/view_depth_masked",
             key="sd_token",
             suffix=".npy",
             kind="depth",
             label_type=LabelType(LabelCategory.DEPTH, "z_mapanything", LabelUnit.METERS),
             description="MapAnything masked metric z-depth [m] at MapAnything resolution, 0=invalid",
+        ),
+        GfLayer(
+            name="init_gaussians",
+            default_path="mapanything_init_v14b/initial_gaussians.ply",
+            key="none",
+            suffix=".ply",
+            kind="gaussians",
+            description="MapAnything initial 3DGS (T4 world frame); every non-xyz PLY vertex property "
+            "is a float attribute of the same name",
         ),
     )
 }
@@ -129,31 +142,36 @@ class GfLayerImporter:
     def __init__(
         self,
         layer: GfLayer,
-        layer_dir: Path,
+        path: Path,
         depth_encoding: DepthEncoding = "uint16",
         png_reoptimize: bool = True,
     ) -> None:
         self.layer = layer
-        self.layer_dir = layer_dir
+        self.path = path  # layer directory, or the PLY file for "gaussians"
         self.depth_encoding = depth_encoding
         self.png_reoptimize = png_reoptimize
         self.n_depth_clipped = 0
 
+    @property
+    def is_camera_label(self) -> bool:
+        return self.layer.kind in ("png", "depth")
+
     def path_for(self, frame: CameraFrameRef) -> Optional[Path]:
         if self.layer.key == "stem":
-            return self.layer_dir / frame.camera_id / f"{frame.image_stem}{self.layer.suffix}"
+            return self.path / frame.camera_id / f"{frame.image_stem}{self.layer.suffix}"
         if self.layer.key == "keyframe_index":
             if frame.keyframe_index is None:
                 return None
-            return self.layer_dir / frame.camera_id / f"frame_{frame.keyframe_index:04d}{self.layer.suffix}"
-        return self.layer_dir / f"{frame.sample_data_token}{self.layer.suffix}"
+            return self.path / frame.camera_id / f"frame_{frame.keyframe_index:04d}{self.layer.suffix}"
+        return self.path / f"{frame.sample_data_token}{self.layer.suffix}"
 
     def has_camera(self, camera_id: str) -> bool:
         if self.layer.key == "sd_token":
-            return self.layer_dir.is_dir()
-        return (self.layer_dir / camera_id).is_dir()
+            return self.path.is_dir()
+        return (self.path / camera_id).is_dir()
 
     def descriptor(self, camera_id: str) -> CameraLabelDescriptor:
+        assert self.layer.label_type is not None
         if self.layer.kind == "png":
             schema = LabelSchema(
                 dtype=np.dtype("uint8"),
@@ -185,10 +203,13 @@ class GfLayerImporter:
             "producer": "gaussian_factory",
             "gf_layer": self.layer.name,
             "gf_key_scheme": self.layer.key,
+            "gf_source": str(self.path),
             "description": self.layer.description,
         }
+        if self.layer.kind == "depth":
+            meta["gf_depth_encoding"] = self.depth_encoding
         for name in self.layer.sidecar_json:
-            if (p := self.layer_dir / name).is_file():
+            if (p := self.path / name).is_file():
                 with p.open("r") as f:
                     meta[Path(name).stem.lstrip("_")] = json.load(f)
         return meta
@@ -223,12 +244,12 @@ class GfLayerImporter:
 def resolve_layers(
     gf_root: Optional[Path],
     layer_names: Optional[List[str]],
-    layer_dir_overrides: Dict[str, Path],
+    layer_path_overrides: Dict[str, Path],
     depth_encoding: DepthEncoding,
     png_reoptimize: bool,
 ) -> List[GfLayerImporter]:
-    """Build importers for requested layers (or every layer whose directory exists)."""
-    unknown = (set(layer_names or []) | set(layer_dir_overrides)) - set(GF_LAYERS)
+    """Build importers for requested layers (or every layer whose source exists)."""
+    unknown = (set(layer_names or []) | set(layer_path_overrides)) - set(GF_LAYERS)
     if unknown:
         raise ValueError(f"Unknown gaussian_factory layer(s) {sorted(unknown)}; known: {sorted(GF_LAYERS)}")
 
@@ -236,37 +257,70 @@ def resolve_layers(
     for name, layer in GF_LAYERS.items():
         if layer_names and name not in layer_names:
             continue
-        if name in layer_dir_overrides:
-            layer_dir = layer_dir_overrides[name]
+        if name in layer_path_overrides:
+            path = layer_path_overrides[name]
         elif gf_root is not None:
-            layer_dir = gf_root / layer.default_subdir
+            path = gf_root / layer.default_path
         else:
             continue
-        if not layer_dir.is_dir():
+        exists = path.is_file() if layer.kind == "gaussians" else path.is_dir()
+        if not exists:
             if layer_names and name in layer_names:
-                raise FileNotFoundError(f"gaussian_factory layer '{name}' directory not found: {layer_dir}")
-            logger.info(f"gaussian_factory layer '{name}' not found at {layer_dir}, skipping")
+                raise FileNotFoundError(f"gaussian_factory layer '{name}' not found: {path}")
+            logger.info(f"gaussian_factory layer '{name}' not found at {path}, skipping")
             continue
-        importers.append(GfLayerImporter(layer, layer_dir, depth_encoding, png_reoptimize))
+        importers.append(GfLayerImporter(layer, path, depth_encoding, png_reoptimize))
     return importers
 
 
-def load_camera_poses_json(path: Path) -> tuple[Dict[str, np.ndarray], Dict[str, JsonLike]]:
-    """Load a gaussian_factory ``{sample_data_token: 4x4 camera->world}`` pose file.
+_PLY_TYPES = {
+    "char": "i1",
+    "int8": "i1",
+    "uchar": "u1",
+    "uint8": "u1",
+    "short": "i2",
+    "int16": "i2",
+    "ushort": "u2",
+    "uint16": "u2",
+    "int": "i4",
+    "int32": "i4",
+    "uint": "u4",
+    "uint32": "u4",
+    "float": "f4",
+    "float32": "f4",
+    "double": "f8",
+    "float64": "f8",
+}
 
-    Accepts both the flat layout (``trajectory_correction/poses.json``) and the trainer's
-    ``refined_poses_step*.json`` layout (``{"meta": ..., "poses": {...}}``). Returns
-    ``(poses, meta)``.
-    """
-    with path.open("r") as f:
-        root = json.load(f)
-    nested = isinstance(root, dict) and isinstance(root.get("poses"), dict)
-    poses = root["poses"] if nested else root
-    meta = root.get("meta", {}) if nested else {}
-    out: Dict[str, np.ndarray] = {}
-    for token, mat in poses.items():
-        arr = np.asarray(mat, dtype=np.float64)
-        if arr.shape != (4, 4):
-            raise ValueError(f"{path}: pose for {token} has shape {arr.shape}, expected (4, 4)")
-        out[token] = arr
-    return out, meta
+
+def read_ply_vertices(path: Path) -> np.ndarray:
+    """Read the ``vertex`` element of a binary little-endian PLY into a structured array."""
+    with path.open("rb") as f:
+        if f.readline().strip() != b"ply":
+            raise ValueError(f"{path}: not a PLY file")
+        fmt = None
+        elements: List[tuple[str, int, List[tuple[str, str]]]] = []
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError(f"{path}: truncated PLY header")
+            tokens = line.decode("ascii").split()
+            if not tokens or tokens[0] in ("comment", "obj_info"):
+                continue
+            if tokens[0] == "format":
+                fmt = tokens[1]
+            elif tokens[0] == "element":
+                elements.append((tokens[1], int(tokens[2]), []))
+            elif tokens[0] == "property":
+                if tokens[1] == "list":
+                    raise ValueError(f"{path}: list properties are not supported")
+                elements[-1][2].append((tokens[2], "<" + _PLY_TYPES[tokens[1]]))
+            elif tokens[0] == "end_header":
+                break
+        if fmt != "binary_little_endian":
+            raise ValueError(f"{path}: only binary_little_endian PLY is supported, got {fmt}")
+        for name, count, props in elements:
+            data = np.fromfile(f, dtype=np.dtype(props), count=count)
+            if name == "vertex":
+                return data
+    raise ValueError(f"{path}: no vertex element")
