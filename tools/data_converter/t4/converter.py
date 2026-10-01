@@ -15,19 +15,17 @@ written here must stay invariant: only T4 identifiers, no conversion options.
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Literal, Optional
+from typing import Dict, Literal, Optional, get_args
 
 import click
 import numpy as np
 import tqdm
 
-from PIL import Image as PILImage
 from scipy.spatial.transform import Rotation
 from upath import UPath
 
@@ -49,7 +47,6 @@ from ncore.impl.data.v4.components import (
     MasksComponent,
     PointCloudsComponent,
     PosesComponent,
-    SequenceComponentGroupsReader,
     SequenceComponentGroupsWriter,
 )
 from ncore.impl.data.v4.types import ComponentGroupAssignments
@@ -60,8 +57,10 @@ from tools.data_converter.t4.utils import (
     keyframe_index_by_sample_token,
     load_annotation_tables,
     load_lidar_points,
+    reencode_if_smaller,
     t4_distortion_to_opencv,
     t4_pose_to_se3,
+    write_sequence_manifest,
 )
 
 
@@ -217,12 +216,12 @@ class T4Converter4(FileBasedDataConverter):
             ego_timestamps_us = np.concatenate([ego_timestamps_us, np.array([seq_end_us_inclusive], dtype=np.uint64)])
             T_rig_world = np.concatenate([T_rig_world, T_rig_world[-1:]], axis=0)
 
-        point_cloud_lidar_ids = lidar_ids if self.lidar_format == "point-cloud" else []
+        lidar_as_pc = self.lidar_format == "point-cloud"
         component_groups = ComponentGroupAssignments.create(
             camera_ids=camera_ids,
-            lidar_ids=[] if self.lidar_format == "point-cloud" else lidar_ids,
+            lidar_ids=[] if lidar_as_pc else lidar_ids,
             radar_ids=[],
-            point_clouds_ids=point_cloud_lidar_ids,
+            point_clouds_ids=lidar_ids if lidar_as_pc else [],
             camera_labels_ids=[],
             profile=self.component_group_profile,
         )
@@ -321,10 +320,7 @@ class T4Converter4(FileBasedDataConverter):
         ncore_paths = store_writer.finalize()
 
         if self.store_sequence_meta:
-            reader = SequenceComponentGroupsReader(ncore_paths)
-            meta_path = UPath(self.output_dir) / sequence_name / f"{reader.sequence_id}.json"
-            with meta_path.open("w") as f:
-                json.dump(reader.get_sequence_meta().to_dict(), f, indent=2)
+            write_sequence_manifest(ncore_paths, UPath(self.output_dir) / sequence_name / f"{sequence_name}.json")
 
     @staticmethod
     def _frame_meta(sd: dict, keyframe_index: Dict[str, int]) -> Dict[str, JsonLike]:
@@ -363,19 +359,18 @@ class T4Converter4(FileBasedDataConverter):
             self.logger.info(f"Using rebuilt lidar (real ring + per-point time) from {self.rebuilt_lidar_dir}")
 
         if self.lidar_format == "point-cloud":
-            attribute_schemas = {
-                "intensity": PointCloudsComponent.AttributeSchema(
-                    transform_type=PointCloud.AttributeTransformType.INVARIANT, dtype=np.dtype("uint8")
-                ),
-                # int16: T4 writes -1 when the ring is unknown
-                "ring": PointCloudsComponent.AttributeSchema(
-                    transform_type=PointCloud.AttributeTransformType.INVARIANT, dtype=np.dtype("int16")
-                ),
+            # ring is int16: T4 writes -1 when the ring is unknown
+            attribute_dtypes = {
+                "intensity": "uint8",
+                "ring": "int16",
+                **({"timestamp_us": "uint64"} if use_rebuilt else {}),
             }
-            if use_rebuilt:
-                attribute_schemas["timestamp_us"] = PointCloudsComponent.AttributeSchema(
-                    transform_type=PointCloud.AttributeTransformType.INVARIANT, dtype=np.dtype("uint64")
+            attribute_schemas = {
+                name: PointCloudsComponent.AttributeSchema(
+                    transform_type=PointCloud.AttributeTransformType.INVARIANT, dtype=np.dtype(dtype)
                 )
+                for name, dtype in attribute_dtypes.items()
+            }
             pc_writer = store_writer.register_component_writer(
                 PointCloudsComponent.Writer,
                 component_instance_name=lidar_id,
@@ -438,15 +433,13 @@ class T4Converter4(FileBasedDataConverter):
                 frame_end_us = ts_us + np.uint64(scan_period_us - 1)
 
             ring_i16 = (
-                np.clip(np.round(ring), -1, np.iinfo(np.int16).max).astype(np.int16)
-                if ring is not None
-                else np.full(n_rays, -1, dtype=np.int16)
+                np.clip(np.round(ring), -1, np.iinfo(np.int16).max).astype(np.int16) if ring is not None else None
             )
 
             if self.lidar_format == "point-cloud":
                 attributes = {
                     "intensity": np.clip(np.round(intensity_raw), 0, 255).astype(np.uint8),
-                    "ring": ring_i16,
+                    "ring": ring_i16 if ring_i16 is not None else np.full(n_rays, -1, dtype=np.int16),
                 }
                 if use_rebuilt:
                     attributes["timestamp_us"] = point_timestamps_us
@@ -471,18 +464,14 @@ class T4Converter4(FileBasedDataConverter):
                 distance_m=distance_m.reshape(1, -1),
                 intensity=intensity.reshape(1, -1),
                 frame_timestamps_us=np.array([ts_us, frame_end_us], dtype=np.uint64),
-                generic_data={"ring": ring_i16} if ring is not None else {},
+                generic_data={"ring": ring_i16} if ring_i16 is not None else {},
                 generic_meta_data=frame_meta,
             )
 
     def _encode_image(self, image_binary: bytes) -> bytes:
         if self.jpeg_quality is None:
             return image_binary
-        with PILImage.open(io.BytesIO(image_binary)) as im:
-            buf = io.BytesIO()
-            im.convert("RGB").save(buf, format="jpeg", quality=self.jpeg_quality, optimize=True)
-        reencoded = buf.getvalue()
-        return reencoded if len(reencoded) < len(image_binary) else image_binary
+        return reencode_if_smaller(image_binary, "jpeg", "RGB", quality=self.jpeg_quality, optimize=True)
 
     def _convert_camera(
         self,
@@ -606,7 +595,7 @@ class T4Converter4(FileBasedDataConverter):
             num_radar_pts.append(int(ann.get("num_radar_pts", -1)))
             visibility_levels.append(visibility_level_by_token.get(ann.get("visibility_token", ""), ""))
 
-        level_names = sorted(set(visibility_levels))
+        level_names, visibility_index = np.unique(np.array(visibility_levels, dtype=str), return_inverse=True)
         cuboids_writer = store_writer.register_component_writer(
             CuboidsComponent.Writer,
             component_instance_name="default",
@@ -616,9 +605,9 @@ class T4Converter4(FileBasedDataConverter):
             {
                 "t4_num_lidar_pts": np.array(num_lidar_pts, dtype=np.int32),
                 "t4_num_radar_pts": np.array(num_radar_pts, dtype=np.int32),
-                "t4_visibility_index": np.array([level_names.index(v) for v in visibility_levels], dtype=np.uint8),
+                "t4_visibility_index": visibility_index.astype(np.uint8),
             },
-            meta_data={"t4_visibility_levels": list[JsonLike](level_names)},
+            meta_data={"t4_visibility_levels": level_names.tolist()},
         )
         cuboids_writer.store_observations(observations)
 
@@ -660,7 +649,7 @@ class T4Converter4(FileBasedDataConverter):
 )
 @click.option(
     "--lidar-format",
-    type=click.Choice(["ray-bundle", "point-cloud"]),
+    type=click.Choice(get_args(LidarFormat)),
     default="ray-bundle",
     show_default=True,
     help="ray-bundle: NCore LidarSensorComponent (float32 direction/distance/intensity). "

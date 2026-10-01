@@ -20,7 +20,6 @@ be appended without the raw T4 tree.
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 
@@ -29,8 +28,6 @@ from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
 import numpy as np
-
-from PIL import Image as PILImage
 
 from ncore.impl.data.types import (
     CameraLabelDescriptor,
@@ -43,6 +40,7 @@ from ncore.impl.data.types import (
     LabelUnit,
     QuantizationParams,
 )
+from tools.data_converter.t4.utils import reencode_if_smaller
 
 
 logger = logging.getLogger(__name__)
@@ -150,7 +148,6 @@ class GfLayerImporter:
         self.path = path  # layer directory, or the PLY file for "gaussians"
         self.depth_encoding = depth_encoding
         self.png_reoptimize = png_reoptimize
-        self.n_depth_clipped = 0
 
     @property
     def is_camera_label(self) -> bool:
@@ -164,11 +161,6 @@ class GfLayerImporter:
                 return None
             return self.path / frame.camera_id / f"frame_{frame.keyframe_index:04d}{self.layer.suffix}"
         return self.path / f"{frame.sample_data_token}{self.layer.suffix}"
-
-    def has_camera(self, camera_id: str) -> bool:
-        if self.layer.key == "sd_token":
-            return self.path.is_dir()
-        return (self.path / camera_id).is_dir()
 
     def descriptor(self, camera_id: str) -> CameraLabelDescriptor:
         assert self.layer.label_type is not None
@@ -186,6 +178,8 @@ class GfLayerImporter:
                     quantized_dtype=np.dtype("uint16"),
                     scale=DEPTH_UINT16_SCALE_M,
                     offset=0.0,
+                    # exact: depth * 256 is a power-of-two scaling and 65535 fits float32's mantissa
+                    intermediate_dtype=np.dtype("float32"),
                 ),
             )
         else:
@@ -214,31 +208,28 @@ class GfLayerImporter:
                     meta[Path(name).stem.lstrip("_")] = json.load(f)
         return meta
 
-    def load(self, path: Path) -> "bytes | np.ndarray":
+    def load(self, path: Path) -> "tuple[bytes | np.ndarray, int]":
+        """Encoded label for ``path`` and the number of depth pixels beyond the uint16 range set invalid."""
         if self.layer.kind == "png":
             data = path.read_bytes()
-            if not self.png_reoptimize:
-                return data
             # lossless re-encode, keep whichever is smaller
-            with PILImage.open(io.BytesIO(data)) as im:
-                if im.mode != "L":
-                    im = im.convert("L")
-                buf = io.BytesIO()
-                im.save(buf, format="png", optimize=True)
-            reencoded = buf.getvalue()
-            return reencoded if len(reencoded) < len(data) else data
+            return (reencode_if_smaller(data, "png", "L", optimize=True) if self.png_reoptimize else data), 0
 
         depth = np.load(path).astype(np.float32, copy=False)
         if depth.ndim != 2:
             raise ValueError(f"{path}: expected (H, W) depth, got shape {depth.shape}")
-        depth = np.where(np.isfinite(depth) & (depth > 0), depth, 0.0).astype(np.float32)
+        if not depth.flags.writeable:
+            depth = depth.copy()
+        invalid = ~(depth > 0)  # also catches NaN
+        invalid |= np.isinf(depth)
+        depth[invalid] = 0.0
+        n_clipped = 0
         if self.depth_encoding == "uint16":
-            max_m = np.iinfo(np.uint16).max * DEPTH_UINT16_SCALE_M
-            too_far = depth > max_m
-            if too_far.any():
-                self.n_depth_clipped += int(too_far.sum())
+            too_far = depth > np.iinfo(np.uint16).max * DEPTH_UINT16_SCALE_M
+            n_clipped = int(np.count_nonzero(too_far))
+            if n_clipped:
                 depth[too_far] = 0.0
-        return depth
+        return depth, n_clipped
 
 
 def resolve_layers(
@@ -265,7 +256,7 @@ def resolve_layers(
             continue
         exists = path.is_file() if layer.kind == "gaussians" else path.is_dir()
         if not exists:
-            if layer_names and name in layer_names:
+            if layer_names:
                 raise FileNotFoundError(f"gaussian_factory layer '{name}' not found: {path}")
             logger.info(f"gaussian_factory layer '{name}' not found at {path}, skipping")
             continue

@@ -5,22 +5,26 @@ load("@ncore_pip_deps//:requirements.bzl", "requirement")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library")
 load("//bazel/pytest:defs.bzl", "pytest_test")
 
-# T4-specific utilities: annotation tables, poses, distortion, lidar loading
+# T4-specific utilities: annotation tables, poses, distortion, lidar loading, image
+# re-encoding, sequence manifest
 py_library(
     name = "pylib_utils",
     srcs = ["utils.py"],
     deps = [
         requirement("numpy"),
+        requirement("pillow"),
+        requirement("universal_pathlib"),
+        "//ncore:pylib",
     ],
 )
 
-# gaussian_factory artifact import (masks / depth / poses -> camera labels)
+# gaussian_factory artifact import (masks / depth -> camera labels, initial Gaussians -> point cloud)
 py_library(
     name = "pylib_gaussian_factory",
     srcs = ["gaussian_factory.py"],
     deps = [
+        ":pylib_utils",
         requirement("numpy"),
-        requirement("pillow"),
         "//ncore:pylib",
     ],
 )
@@ -30,11 +34,9 @@ py_library(
     name = "pylib",
     srcs = ["converter.py"],
     deps = [
-        ":pylib_gaussian_factory",
         ":pylib_utils",
         requirement("click"),
         requirement("numpy"),
-        requirement("pillow"),
         requirement("scipy"),
         requirement("tqdm"),
         requirement("universal_pathlib"),
@@ -57,18 +59,25 @@ alias(
 )
 
 # Append gaussian_factory layers to a converted sequence as extra stores
-py_binary(
-    name = "gf_append",
+py_library(
+    name = "pylib_gf_append",
     srcs = ["gf_append.py"],
-    main = "gf_append.py",
     deps = [
         ":pylib_gaussian_factory",
+        ":pylib_utils",
         requirement("click"),
         requirement("numpy"),
         requirement("tqdm"),
         requirement("universal_pathlib"),
         "//ncore:pylib",
     ],
+)
+
+py_binary(
+    name = "gf_append",
+    srcs = ["gf_append.py"],
+    main = "gf_append.py",
+    deps = [":pylib_gf_append"],
 )
 
 # Storage breakdown: raw T4 vs gaussian_factory needs vs NCore output
@@ -81,23 +90,18 @@ py_binary(
         ":pylib_utils",
         requirement("click"),
         requirement("numpy"),
-        requirement("pillow"),
     ],
 )
 
 # Converter test on a synthetic T4 sequence (no external data needed)
 pytest_test(
     name = "pytest_converter",
-    srcs = [
-        "converter_test.py",
-        "gf_append.py",
-    ],
+    srcs = ["converter_test.py"],
     python_versions = ["3.11"],
     deps = [
         ":pylib",
         ":pylib_gaussian_factory",
-        requirement("click"),
-        requirement("tqdm"),
+        ":pylib_gf_append",
         requirement("numpy"),
         requirement("pillow"),
         requirement("universal_pathlib"),

@@ -5,12 +5,18 @@
 
 from __future__ import annotations
 
+import io
 import json
 
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 import numpy as np
+
+from PIL import Image as PILImage
+from upath import UPath
+
+from ncore.impl.data.v4.components import SequenceComponentGroupsReader
 
 
 _REQUIRED_FILES: tuple[str, ...] = (
@@ -89,11 +95,6 @@ def load_lidar_points(path: Path) -> np.ndarray:
     return raw.reshape(-1, _T4_LIDAR_FLOATS_PER_POINT)
 
 
-def load_lidar_xyzi(path: Path) -> np.ndarray:
-    """Load a ``LIDAR_CONCAT/*.pcd.bin`` file as an Nx4 float32 (x, y, z, intensity) array."""
-    return load_lidar_points(path)[:, :4]
-
-
 def keyframe_index_by_sample_token(samples: List[Dict[str, Any]], scene: Dict[str, Any]) -> Dict[str, int]:
     """Ordinal of each ``sample`` along the scene's ``first_sample_token`` -> ``next`` chain.
 
@@ -121,3 +122,22 @@ def t4_distortion_to_opencv(distortion: List[float]) -> tuple[np.ndarray, np.nda
     tangential = np.array([d[2], d[3]], dtype=np.float32)
     thin_prism = d[8:12].copy()
     return radial, tangential, thin_prism
+
+
+def reencode_if_smaller(data: bytes, format: str, mode: str, **save_kwargs: Any) -> bytes:
+    """Re-encode an image as ``format`` (after converting to ``mode``); keep whichever is smaller."""
+    with PILImage.open(io.BytesIO(data)) as im:
+        buf = io.BytesIO()
+        (im if im.mode == mode else im.convert(mode)).save(buf, format=format, **save_kwargs)
+    reencoded = buf.getvalue()
+    return reencoded if len(reencoded) < len(data) else data
+
+
+def write_sequence_manifest(store_paths: Sequence[UPath | Path], meta_path: UPath | Path) -> None:
+    """(Re)write the ``<sequence_id>.json`` store manifest listing ``store_paths``, atomically."""
+    meta = SequenceComponentGroupsReader([UPath(p) for p in store_paths]).get_sequence_meta()
+    meta_path = UPath(meta_path)
+    tmp = meta_path.with_suffix(".json.tmp")
+    with tmp.open("w") as f:
+        json.dump(meta.to_dict(), f, indent=2)
+    tmp.replace(meta_path)

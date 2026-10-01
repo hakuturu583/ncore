@@ -21,8 +21,10 @@ import json
 import logging
 import shutil
 
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Callable, Deque, Dict, Iterator, List, Literal, Optional, TypeVar, get_args
 
 import click
 import numpy as np
@@ -37,7 +39,6 @@ from ncore.impl.data.v4.components import (
     PointCloudsComponent,
     SequenceComponentGroupsReader,
     SequenceComponentGroupsWriter,
-    SequenceMeta,
 )
 from tools.data_converter.t4.gaussian_factory import (
     GF_LAYERS,
@@ -47,9 +48,18 @@ from tools.data_converter.t4.gaussian_factory import (
     read_ply_vertices,
     resolve_layers,
 )
+from tools.data_converter.t4.utils import write_sequence_manifest
 
 
 logger = logging.getLogger(__name__)
+
+StoreType = Literal["itar", "directory"]
+T = TypeVar("T")
+
+# Labels loaded ahead of the (single-threaded) store writer; np.load / PIL release the GIL.
+# Bounded so at most this many decoded depth maps (~21 MB each) are held at once.
+_LOAD_WORKERS = 4
+_LOAD_PREFETCH = 8
 
 
 def find_sequence_meta(sequence_dir: Path) -> Path:
@@ -84,11 +94,23 @@ def camera_frames_from_reader(reader: SequenceComponentGroupsReader) -> Dict[str
                     timestamp_us=int(ts),
                     sample_data_token=str(meta["t4_sample_data_token"]),
                     image_stem=Path(str(meta["t4_filename"])).stem,
-                    keyframe_index=int(kf) if isinstance(kf, (int, float)) else None,
+                    keyframe_index=kf if isinstance(kf, int) else None,
                 )
             )
         frames[camera_id] = refs
     return frames
+
+
+def _prefetch(fn: Callable[[Path], T], paths: List[Path]) -> Iterator[T]:
+    """``map(fn, paths)`` in order, computed ahead on a thread pool with bounded look-ahead."""
+    with ThreadPoolExecutor(_LOAD_WORKERS) as pool:
+        pending: Deque[Future[T]] = deque()
+        for path in paths:
+            pending.append(pool.submit(fn, path))
+            if len(pending) >= _LOAD_PREFETCH:
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
 
 
 def _write_camera_labels(
@@ -99,9 +121,8 @@ def _write_camera_labels(
 ) -> int:
     component_meta = importer.component_meta()
     n_total = 0
+    n_clipped = 0
     for camera_id, frames in sorted(camera_frames.items()):
-        if not importer.has_camera(camera_id):
-            continue
         located = [(f, p) for f in frames if (p := importer.path_for(f)) is not None and p.is_file()]
         if not located:
             continue
@@ -113,9 +134,13 @@ def _write_camera_labels(
             generic_meta_data=component_meta,
             descriptor=descriptor,
         )
-        for frame, path in tqdm.tqdm(located, desc=f"gf {importer.layer.name} {camera_id}"):
+        loaded = _prefetch(importer.load, [p for _, p in located])
+        for (frame, _), (data, clipped) in tqdm.tqdm(
+            zip(located, loaded), total=len(located), desc=f"gf {importer.layer.name} {camera_id}"
+        ):
+            n_clipped += clipped
             label_writer.store_label(
-                importer.load(path),
+                data,
                 timestamp_us=frame.timestamp_us,
                 generic_meta_data={"t4_sample_data_token": frame.sample_data_token},
             )
@@ -124,11 +149,8 @@ def _write_camera_labels(
             f"no artifact for {len(frames) - len(located)} frames"
         )
         n_total += len(located)
-    if importer.n_depth_clipped:
-        logger.warning(
-            f"gaussian_factory {importer.layer.name}: {importer.n_depth_clipped} depth px beyond uint16 range "
-            "set invalid"
-        )
+    if n_clipped:
+        logger.warning(f"gaussian_factory {importer.layer.name}: {n_clipped} depth px beyond uint16 range set invalid")
     return n_total
 
 
@@ -158,7 +180,7 @@ def _write_gaussians(
             for n, a in attributes.items()
         },
     )
-    xyz = np.stack([vertices["x"], vertices["y"], vertices["z"]], axis=1).astype(np.float32)
+    xyz = np.stack([vertices["x"], vertices["y"], vertices["z"]], axis=1).astype(np.float32, copy=False)
     pc_writer.store_pc(
         xyz=xyz,
         reference_frame_id="world",
@@ -169,9 +191,9 @@ def _write_gaussians(
     return len(xyz)
 
 
-def _remove_store(path: Path) -> None:
+def _remove_store(path: Path | UPath) -> None:
     if path.is_dir():
-        shutil.rmtree(path)
+        shutil.rmtree(str(path))
     elif path.exists():
         path.unlink()
 
@@ -183,15 +205,13 @@ def append_gf_layers(
     layer_paths: Optional[Dict[str, Path]] = None,
     depth_encoding: DepthEncoding = "uint16",
     png_reoptimize: bool = True,
-    store_type: Literal["itar", "directory"] = "itar",
+    store_type: StoreType = "itar",
 ) -> Dict[str, int]:
     """Append (or replace) gaussian_factory layers as extra stores; returns items stored per layer."""
     meta_path = find_sequence_meta(sequence_dir)
-    with meta_path.open("r") as f:
-        sequence_meta = SequenceMeta.from_dict(json.load(f))
-    store_paths = [sequence_dir / s.path for s in sequence_meta.component_stores]
+    store_paths = SequenceComponentGroupsReader.expand_component_group_paths([UPath(meta_path)])
 
-    reader = SequenceComponentGroupsReader([UPath(p) for p in store_paths])
+    reader = SequenceComponentGroupsReader(store_paths)
     importers = resolve_layers(gf_root, layer_names, layer_paths or {}, depth_encoding, png_reoptimize)
     if not importers:
         raise FileNotFoundError(f"no gaussian_factory layers found (gf_root={gf_root}, layers={layer_names})")
@@ -203,36 +223,35 @@ def append_gf_layers(
         group_name = f"gf_{name}"
         tmp_dir = sequence_dir / f".gf_append_{name}.tmp"
         _remove_store(tmp_dir)
-        writer = SequenceComponentGroupsWriter.from_reader(
-            output_dir_path=UPath(tmp_dir),
-            store_base_name=reader.sequence_id,
-            sequence_reader=reader,
-            store_type=store_type,
-        )
-        if importer.is_camera_label:
-            stored[name] = _write_camera_labels(importer, writer, group_name, camera_frames)
-        else:
-            stored[name] = _write_gaussians(importer, writer, group_name, reader.sequence_timestamp_interval_us.start)
-        if stored[name] == 0:
-            logger.warning(f"gaussian_factory {name}: nothing matched the sequence frames, layer not written")
+        try:
+            writer = SequenceComponentGroupsWriter.from_reader(
+                output_dir_path=UPath(tmp_dir),
+                store_base_name=reader.sequence_id,
+                sequence_reader=reader,
+                store_type=store_type,
+            )
+            if importer.is_camera_label:
+                stored[name] = _write_camera_labels(importer, writer, group_name, camera_frames)
+            else:
+                stored[name] = _write_gaussians(
+                    importer, writer, group_name, reader.sequence_timestamp_interval_us.start
+                )
+            if stored[name] == 0:
+                logger.warning(f"gaussian_factory {name}: nothing matched the sequence frames, layer not written")
+                continue
+            for new_path in writer.finalize():
+                target = UPath(sequence_dir / new_path.name).absolute()
+                if target.exists():
+                    logger.info(f"replacing existing store {target.name}")
+                _remove_store(target)
+                shutil.move(str(new_path), str(target))
+                if target not in store_paths:
+                    store_paths.append(target)
+        finally:
             _remove_store(tmp_dir)
-            continue
-        for new_path in writer.finalize():
-            target = sequence_dir / new_path.name
-            if target.exists():
-                logger.info(f"replacing existing store {target.name}")
-            _remove_store(target)
-            shutil.move(str(new_path), str(target))
-            if target not in store_paths:
-                store_paths.append(target)
-        _remove_store(tmp_dir)
 
-    # rewrite the store manifest (atomically) so the JSON lists base + all layers
-    updated = SequenceComponentGroupsReader([UPath(p) for p in store_paths]).get_sequence_meta()
-    tmp_meta = meta_path.with_suffix(".json.tmp")
-    with tmp_meta.open("w") as f:
-        json.dump(updated.to_dict(), f, indent=2)
-    tmp_meta.replace(meta_path)
+    # rewrite the store manifest so the JSON lists base + all layers
+    write_sequence_manifest(store_paths, meta_path)
     return stored
 
 
@@ -258,13 +277,13 @@ def append_gf_layers(
 )
 @click.option(
     "--depth-encoding",
-    type=click.Choice(["uint16", "float32"]),
+    type=click.Choice(get_args(DepthEncoding)),
     default="uint16",
     show_default=True,
     help="uint16 quantizes depth to 1/256 m (range 256 m); float32 is lossless.",
 )
 @click.option("--png-reoptimize/--no-png-reoptimize", default=True, show_default=True)
-@click.option("--store-type", type=click.Choice(["itar", "directory"]), default="itar", show_default=True)
+@click.option("--store-type", type=click.Choice(get_args(StoreType)), default="itar", show_default=True)
 @click.option("--verbose", is_flag=True, default=False)
 def main(
     sequence_dir: Path,
@@ -273,7 +292,7 @@ def main(
     layer_paths: tuple[str, ...],
     depth_encoding: DepthEncoding,
     png_reoptimize: bool,
-    store_type: Literal["itar", "directory"],
+    store_type: StoreType,
     verbose: bool,
 ) -> None:
     """Append gaussian_factory layers to a converted T4 NCore sequence."""
@@ -285,7 +304,13 @@ def main(
             raise click.BadParameter(f"expected NAME=PATH, got {spec!r}", param_hint="--layer-path")
         overrides[name] = Path(path)
     stored = append_gf_layers(
-        sequence_dir, gf_root, list(layers), overrides, depth_encoding, png_reoptimize, store_type
+        sequence_dir,
+        gf_root,
+        layer_names=list(layers),
+        layer_paths=overrides,
+        depth_encoding=depth_encoding,
+        png_reoptimize=png_reoptimize,
+        store_type=store_type,
     )
     for name, n in stored.items():
         click.echo(f"{name}: {n}")

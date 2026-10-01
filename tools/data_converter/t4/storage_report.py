@@ -14,7 +14,6 @@ gaussian_factory artifacts, and — if given — the size of each NCore store.
 
 from __future__ import annotations
 
-import io
 import json
 
 from pathlib import Path
@@ -23,10 +22,8 @@ from typing import Dict, Iterable, List, Optional
 import click
 import numpy as np
 
-from PIL import Image as PILImage
-
 from tools.data_converter.t4.gaussian_factory import GF_LAYERS
-from tools.data_converter.t4.utils import index_by_token, load_annotation_tables
+from tools.data_converter.t4.utils import index_by_token, load_annotation_tables, reencode_if_smaller
 
 
 def _du(path: Path) -> int:
@@ -40,7 +37,7 @@ def _fmt(n: float) -> str:
         if abs(n) < 1024 or unit == "TB":
             return f"{n:8.1f} {unit}"
         n /= 1024
-    return ""
+    raise AssertionError("unreachable")
 
 
 def _row(label: str, size: float, total: float) -> str:
@@ -52,12 +49,9 @@ def _probe_jpeg(paths: List[Path], qualities: Iterable[int]) -> Dict[int, float]
     ratios: Dict[int, List[float]] = {q: [] for q in qualities}
     for p in paths:
         src = p.read_bytes()
-        with PILImage.open(io.BytesIO(src)) as im:
-            rgb = im.convert("RGB")
-            for q in ratios:
-                buf = io.BytesIO()
-                rgb.save(buf, format="jpeg", quality=q, optimize=True)
-                ratios[q].append(min(1.0, len(buf.getvalue()) / len(src)))
+        for q in ratios:
+            # same encoder settings as the converter's --jpeg-quality
+            ratios[q].append(len(reencode_if_smaller(src, "jpeg", "RGB", quality=q, optimize=True)) / len(src))
     return {q: float(np.mean(r)) for q, r in ratios.items() if r}
 
 
@@ -88,11 +82,17 @@ def main(
     sensors = index_by_token(tables["sensor"])
     calibs = index_by_token(tables["calibrated_sensor"])
 
+    def channel_of(sd: dict) -> str:
+        return sensors[calibs[sd["calibrated_sensor_token"]]["sensor_token"]]["channel"]
+
+    def used(ch: str) -> bool:
+        return ch in camera_ids or ch == "LIDAR_CONCAT"
+
     # per-channel file sizes split into keyframe / non-keyframe
     per_channel: Dict[str, Dict[str, int]] = {}
     referenced: set[str] = set()
     for sd in tables["sample_data"]:
-        ch = sensors[calibs[sd["calibrated_sensor_token"]]["sensor_token"]]["channel"]
+        ch = channel_of(sd)
         size = _du(t4_dir / sd["filename"])
         referenced.add(sd["filename"])
         entry = per_channel.setdefault(ch, {"key": 0, "nonkey": 0, "n_key": 0, "n_nonkey": 0})
@@ -100,6 +100,7 @@ def main(
         entry[kind] += size
         entry[f"n_{kind}"] += 1
 
+    t4_total = _du(t4_dir)
     data_total = _du(t4_dir / "data")
     unreferenced = data_total - sum(e["key"] + e["nonkey"] for e in per_channel.values())
     parts = {
@@ -108,15 +109,14 @@ def main(
         "map": _du(t4_dir / "map"),
         "data (unreferenced files)": max(unreferenced, 0),
     }
-    other = _du(t4_dir) - data_total - sum(v for k, v in parts.items() if k != "data (unreferenced files)")
+    other = t4_total - data_total - sum(v for k, v in parts.items() if k != "data (unreferenced files)")
     parts["other"] = max(other, 0)
-    t4_total = _du(t4_dir)
 
     needed = {"annotation": parts["annotation"]}
     lanelet2 = t4_dir / "map" / "lanelet2_map.osm"
     needed["map/lanelet2_map.osm"] = _du(lanelet2)
     for ch, e in per_channel.items():
-        if ch in camera_ids or ch == "LIDAR_CONCAT":
+        if used(ch):
             needed[f"{ch} keyframes"] = e["key"]
 
     print(f"T4 sequence: {t4_dir}  total {_fmt(t4_total).strip()}")
@@ -124,7 +124,7 @@ def main(
         print(_row(k, v, t4_total))
     for ch in sorted(per_channel):
         e = per_channel[ch]
-        use = "used" if (ch in camera_ids or ch == "LIDAR_CONCAT") else "unused"
+        use = "used" if used(ch) else "unused"
         print(_row(f"data/{ch} keyframes ({e['n_key']}) [{use}]", e["key"], t4_total))
         print(_row(f"data/{ch} non-keyframes ({e['n_nonkey']}) [unused]", e["nonkey"], t4_total))
     needed_total = sum(needed.values())
@@ -142,8 +142,7 @@ def main(
         imgs = sorted(
             t4_dir / sd["filename"]
             for sd in tables["sample_data"]
-            if sd.get("is_key_frame")
-            and sensors[calibs[sd["calibrated_sensor_token"]]["sensor_token"]]["channel"] in camera_ids
+            if sd.get("is_key_frame") and channel_of(sd) in camera_ids
         )
         step = max(1, len(imgs) // max(probe_images, 1))
         probe = _probe_jpeg(imgs[::step][:probe_images], jpeg_qualities)
@@ -165,13 +164,14 @@ def main(
 
     if ncore_dir is not None:
         stores = sorted(p for p in ncore_dir.iterdir() if p.name.endswith((".itar", ".zarr", ".json")))
-        nc_total = sum(_du(p) for p in stores)
+        store_sizes = {p.name: _du(p) for p in stores}
+        nc_total = sum(store_sizes.values())
         print(f"\nNCore sequence: {ncore_dir}  total {_fmt(nc_total).strip()}")
-        for p in stores:
-            print(_row(p.name, _du(p), nc_total))
+        for name, size in store_sizes.items():
+            print(_row(name, size, nc_total))
         print(_row("NCore / T4 total", nc_total, t4_total))
         report["ncore_total"] = nc_total
-        report["ncore_stores"] = {p.name: _du(p) for p in stores}
+        report["ncore_stores"] = store_sizes
 
     if json_out is not None:
         json_out.write_text(json.dumps(report, indent=2))
